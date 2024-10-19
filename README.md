@@ -1,2 +1,2 @@
 # Rako Controls
-Rako Controls custom component for Home Assistant
+Home Assistant Integration for [Rako Controls](https://rakocontrols.com)
