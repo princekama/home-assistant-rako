@@ -100,13 +100,6 @@ class RakoLightEntity(LightEntity):
         self.async_write_ha_state()
 
     @property
-    def icon(self) -> str:
-        """Return the icon to be used in the frontend."""
-        if not self._channel:
-            return "mdi:lightbulb-group"
-        return "mdi:lightbulb"
-
-    @property
     def is_on(self) -> bool:
         """Return true if light is on."""
         return self.brightness > 0
@@ -116,7 +109,7 @@ class RakoLightEntity(LightEntity):
         """Return the display name of this light."""
         if not self._channel:
             return self._room.title
-        return f"{self._room.title} - {self._channel.title}"
+        return self._channel.title
 
     @property
     def should_poll(self) -> bool:
