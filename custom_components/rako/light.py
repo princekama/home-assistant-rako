@@ -116,7 +116,7 @@ class RakoLightEntity(LightEntity):
         """Return the display name of this light."""
         if not self._channel:
             return self._room.title
-        return f"{self._channel.title}"
+        return self._channel.title
 
     @property
     def should_poll(self) -> bool:
