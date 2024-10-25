@@ -13,5 +13,6 @@
     "rakopy==0.0.3"
   ],
   "ssdp": [],
-  "zeroconf": []
+  "zeroconf": [],
+  "version": "0.0.1"
 }
