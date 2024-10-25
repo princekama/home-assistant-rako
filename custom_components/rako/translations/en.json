@@ -1,0 +1,23 @@
+{
+    "config": {
+        "abort": {
+            "already_configured": "Device is already configured"
+        },
+        "error": {
+            "cannot_connect": "Failed to connect",
+            "unknown": "Unexpected error"
+        },
+        "step": {
+            "user": {
+                "data": {
+                    "name": "Client Name",
+                    "host": "Host"
+                },
+                "data_description": {
+                  "name": "A name used to identity clients with Rako Hub"
+                },
+                "description": "Add a Rako Hub"
+            }
+        }
+    }
+}
