@@ -15,4 +15,4 @@ jobs:
         uses: "hacs/action@main"
         with:
           category: "integration"
-        with.ignore: "archived brands description hacsjson images information issues topics"
+          ignore: "archived brands description hacsjson images information issues topics"
