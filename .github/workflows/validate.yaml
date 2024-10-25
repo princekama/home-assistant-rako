@@ -1,14 +1,14 @@
-name: HACS validation
+name: HACS Validate
 
 on:
-  push: 
+  push:
   pull_request:
   schedule:
     - cron: "0 0 * * *"
   workflow_dispatch:
 
 jobs:
-  validate-hacs:
+  validate:
     runs-on: "ubuntu-latest"
     steps:
       - name: HACS validation
