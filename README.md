@@ -1,6 +1,8 @@
 # Rako
 Home Assistant Integration for [Rako Controls](https://rakocontrols.com)
 
+This integration allows users to control Rako lighting system over the local network.
+
 > [!IMPORTANT]
 > This integration works with Rako hubs like [RK-HUB](https://rakocontrols.com/rkhub/) or [WK-HUB](https://rakocontrols.com/wkhub/).
 
