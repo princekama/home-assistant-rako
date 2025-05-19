@@ -42,26 +42,36 @@ async def async_setup_entry(
     rooms = await hub_client.get_rooms()
     for room in rooms:
         if room.type == "LIGHT":
-            channel_level = levels_lookup[room.id][0]
-            lights.append(
-                RakoLightEntity(
-                    hub_client=hub_client,
-                    room=room,
-                    channel=None,
-                    channel_level=channel_level
-                )
-            )
-
-            for channel in room.channels:
-                channel_level = levels_lookup[room.id][channel.id]
-                lights.append(
-                    RakoLightEntity(
-                        hub_client=hub_client,
-                        room=room,
-                        channel=channel,
-                        channel_level=channel_level
+            room_levels = levels_lookup.get(room.id, None)
+            if room_levels != None:
+                channel_level = room_levels.get(0, None)
+                if channel_level != None:
+                    lights.append(
+                        RakoLightEntity(
+                            hub_client=hub_client,
+                            room=room,
+                            channel=None,
+                            channel_level=channel_level
+                        )
                     )
-                )
+                else:
+                    _LOGGER.warning("Cannot find levels for room %s and channel %s", room.id, 0)
+                
+                for channel in room.channels:
+                    channel_level = room_levels.get(channel.id, None)
+                    if channel_level != None:
+                        lights.append(
+                            RakoLightEntity(
+                                hub_client=hub_client,
+                                room=room,
+                                channel=channel,
+                                channel_level=channel_level
+                            )
+                        )
+                    else:
+                        _LOGGER.warning("Cannot find levels for room %s and channel %s", room.id, channel.id)
+            else:
+                _LOGGER.warning("Cannot find levels for room %s", room.id)
 
     async_add_entities(lights, True)
 

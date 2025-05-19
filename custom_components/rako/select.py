@@ -34,9 +34,13 @@ async def async_setup_entry(
 
     rooms = await hub_client.get_rooms()
     for room in rooms:
-        scenes.append(
-            RakoSceneEntity(hub_client, room, levels_lookup[room.id])
-        )
+        room_levels = levels_lookup.get(room.id, None)
+        if room_levels != None:
+            scenes.append(
+                RakoSceneEntity(hub_client, room, levels_lookup[room.id])
+            )
+        else:
+            _LOGGER.warning("Cannot find levels for room %s", room.id)
 
     async_add_entities(scenes, True)
 
