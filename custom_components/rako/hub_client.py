@@ -4,9 +4,9 @@ import asyncio
 import contextlib
 import logging
 
+from homeassistant.components.cover import CoverEntity
 from homeassistant.components.light import LightEntity
 from homeassistant.components.select import SelectEntity
-from homeassistant.components.cover import CoverEntity
 from homeassistant.core import HomeAssistant
 from rakopy.hub import Hub
 from rakopy.model import LevelChangedEvent, SceneChangedEvent
@@ -31,9 +31,9 @@ class HubClient(Hub):
         self.hass = hass
 
         self._event_listener_task: Task | None = None
+        self._cover_map: dict[str, CoverEntity] = {}
         self._light_map: dict[str, LightEntity] = {}
         self._scene_map: dict[str, SelectEntity] = {}
-        self._cover_map: dict[str, CoverEntity] = {}
 
     @property
     def hub_id(self) -> str:
@@ -42,6 +42,11 @@ class HubClient(Hub):
         rako_domain_entry_data: RakoDomainEntryData = entry.runtime_data
 
         return rako_domain_entry_data['hub_id']
+
+    async def add_cover(self, cover: CoverEntity) -> None:
+        """Register a cover to listen for state updates."""
+        self._cover_map[cover.unique_id] = cover
+        self._try_start_event_listener_task()
 
     async def add_light(self, light: LightEntity) -> None:
         """Register a light to listen for state updates."""
@@ -53,10 +58,11 @@ class HubClient(Hub):
         self._scene_map[select.unique_id] = select
         self._try_start_event_listener_task()
 
-    async def add_cover(self, cover: CoverEntity) -> None:
-        """Register a cover to listen for state updates."""
-        self._cover_map[cover.unique_id] = cover
-        self._try_start_event_listener_task()
+    async def remove_cover(self, cover: CoverEntity) -> None:
+        """Deregister a cover to listen for state updates."""
+        if cover.unique_id in self._cover_map:
+            del self._cover_map[cover.unique_id]
+            self._try_cancel_event_listener_task()
 
     async def remove_light(self, light: LightEntity) -> None:
         """Deregister a light to listen for state updates."""
@@ -68,12 +74,6 @@ class HubClient(Hub):
         """Deregister a select to listen for state updates."""
         if select.unique_id in self._scene_map:
             del self._scene_map[select.unique_id]
-            self._try_cancel_event_listener_task()
-
-    async def remove_cover(self, cover: CoverEntity) -> None:
-        """Deregister a cover to listen for state updates."""
-        if cover.unique_id in self._cover_map:
-            del self._cover_map[cover.unique_id]
             self._try_cancel_event_listener_task()
 
     def _try_start_event_listener_task(self) -> None:
@@ -100,25 +100,25 @@ async def subscribe_to_events(hub_client: HubClient) -> None:
         try:
             if event and isinstance(event, LevelChangedEvent):
                 unique_id = f"{hub_client.hub_id}_{event.room_id}_{event.channel_id}"
-                
-                # Handle light entities
-                if unique_id in hub_client._light_map:
-                    if event.target_level is not None:
-                        hub_client._light_map[unique_id].brightness = event.target_level
-                    else:
-                        hub_client._light_map[unique_id].brightness = event.current_level
-                
+
                 # Handle cover entities (blinds use level for position)
                 if unique_id in hub_client._cover_map:
                     if event.target_level is not None:
                         hub_client._cover_map[unique_id].current_cover_position = event.target_level
                     else:
                         hub_client._cover_map[unique_id].current_cover_position = event.current_level
-                        
+
+                # Handle light entities
+                if unique_id in hub_client._light_map:
+                    if event.target_level is not None:
+                        hub_client._light_map[unique_id].brightness = event.target_level
+                    else:
+                        hub_client._light_map[unique_id].brightness = event.current_level
+
             elif event and isinstance(event, SceneChangedEvent):
                 unique_id = f"{hub_client.hub_id}_{event.room_id}"
                 if unique_id in hub_client._scene_map:
                     hub_client._scene_map[unique_id].current_option = event.active_scene_id
-                    
+
         except Exception as e:
             _LOGGER.exception("Unexpected exception: %s", repr(e))
