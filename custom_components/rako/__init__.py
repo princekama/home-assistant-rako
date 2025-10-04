@@ -10,7 +10,7 @@ from .const import DOMAIN
 from .hub_client import HubClient
 from .model import RakoDomainEntryData
 
-PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SELECT]
+PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.SELECT, Platform.COVER]
 
 type RakoConfigEntry = ConfigEntry[RakoDomainEntryData]
 
