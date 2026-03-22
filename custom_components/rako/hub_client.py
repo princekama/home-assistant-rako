@@ -62,19 +62,19 @@ class HubClient(Hub):
         """Deregister a cover to listen for state updates."""
         if cover.unique_id in self._cover_map:
             del self._cover_map[cover.unique_id]
-            self._try_cancel_event_listener_task()
+            await self._try_cancel_event_listener_task()
 
     async def remove_light(self, light: LightEntity) -> None:
         """Deregister a light to listen for state updates."""
         if light.unique_id in self._light_map:
             del self._light_map[light.unique_id]
-            self._try_cancel_event_listener_task()
+            await self._try_cancel_event_listener_task()
 
     async def remove_scene(self, select: SelectEntity) -> None:
         """Deregister a select to listen for state updates."""
         if select.unique_id in self._scene_map:
             del self._scene_map[select.unique_id]
-            self._try_cancel_event_listener_task()
+            await self._try_cancel_event_listener_task()
 
     def _try_start_event_listener_task(self) -> None:
         """Start the event listener task."""
