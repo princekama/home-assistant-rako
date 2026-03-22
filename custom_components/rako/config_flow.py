@@ -35,7 +35,7 @@ async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str,
         hub_info = await asyncio.wait_for(
             hub.get_hub_status(), timeout=TIMEOUT
         )
-    except:
+    except Exception:
         raise CannotConnect
 
     return {"title": "Rako Hub", "hub_id": hub_info.id}
@@ -54,14 +54,14 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             try:
                 info = await validate_input(self.hass, user_input)
-                await self.async_set_unique_id(f"Rako_Hub_{info["hub_id"]}")
-                self._abort_if_unique_id_configured()
             except CannotConnect:
                 errors["base"] = "cannot_connect"
             except Exception:
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
+                await self.async_set_unique_id(f"Rako_Hub_{info['hub_id']}")
+                self._abort_if_unique_id_configured()
                 return self.async_create_entry(title=info["title"], data=user_input)
 
         return self.async_show_form(
