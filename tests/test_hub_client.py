@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
-
-import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 from homeassistant.core import HomeAssistant
 
 from rakopy.model import LevelChangedEvent, SceneChangedEvent
