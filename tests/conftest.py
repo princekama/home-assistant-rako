@@ -1,7 +1,7 @@
 """Shared fixtures for Rako integration tests."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.const import CONF_HOST, CONF_NAME
@@ -16,8 +16,6 @@ from rakopy.model import (
     Room,
     Scene,
 )
-
-from custom_components.rako.const import DOMAIN
 
 
 MOCK_HUB_ID = "AB1234"

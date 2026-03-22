@@ -165,7 +165,7 @@ async def test_try_cancel_only_when_empty(hass: HomeAssistant) -> None:
     async def noop():
         await asyncio.sleep(3600)
 
-    task = asyncio.get_event_loop().create_task(noop())
+    task = asyncio.create_task(noop())
     client._event_listener_task = task
     client._light_map = {"l1": _mock_entity("l1"), "l2": _mock_entity("l2")}
 

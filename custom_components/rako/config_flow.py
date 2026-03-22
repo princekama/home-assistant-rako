@@ -60,7 +60,7 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
             else:
-                await self.async_set_unique_id(f"Rako_Hub_{info["hub_id"]}")
+                await self.async_set_unique_id(f"Rako_Hub_{info['hub_id']}")
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(title=info["title"], data=user_input)
 

@@ -1,7 +1,7 @@
 """Tests for light.py."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.components.light import ATTR_BRIGHTNESS, ColorMode
@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant
 
 from custom_components.rako.light import RakoLightEntity, async_setup_entry
 from rakopy.errors import SendCommandError
-from rakopy.model import Channel, ChannelLevel, LevelInfo, Room, Scene
+from rakopy.model import Channel, Room
 
 from tests.conftest import MOCK_HUB_ID, make_channel_level
 

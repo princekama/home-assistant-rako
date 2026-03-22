@@ -1,7 +1,7 @@
 """Tests for cover.py."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 from homeassistant.components.cover import ATTR_POSITION, CoverDeviceClass, CoverEntityFeature
@@ -9,7 +9,7 @@ from homeassistant.core import HomeAssistant
 
 from custom_components.rako.cover import RakoCoverEntity, async_setup_entry
 from rakopy.errors import SendCommandError
-from rakopy.model import Channel, Room, Scene
+from rakopy.model import Channel, Room
 
 from tests.conftest import MOCK_HUB_ID, make_channel_level
 
