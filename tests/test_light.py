@@ -150,6 +150,14 @@ def test_color_mode_brightness(mock_hub_client) -> None:
     assert light.supported_color_modes == {ColorMode.BRIGHTNESS}
 
 
+def test_rgb_channel_color_mode_brightness(mock_hub_client) -> None:
+    """RGB channels should remain brightness-only until color support exists."""
+    ch = Channel(id=1, title="RGB", type="LIGHT", color_type="RGB", color_title=None, multi_channel_component=None)
+    light = _make_light(mock_hub_client, channel=ch)
+    assert light.color_mode == ColorMode.BRIGHTNESS
+    assert light.supported_color_modes == {ColorMode.BRIGHTNESS}
+
+
 # ---------------------------------------------------------------------------
 # Turn on / off
 # ---------------------------------------------------------------------------
