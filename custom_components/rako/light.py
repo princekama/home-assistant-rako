@@ -93,10 +93,10 @@ class RakoLightEntity(LightEntity):
             self._brightness = channel_level.target_level
         else:
             self._brightness = channel_level.current_level
-        # Only support brigthness for now
-        if not channel or not channel.color_type:
-            self.supported_color_modes = {ColorMode.BRIGHTNESS}
-            self.color_mode = ColorMode.BRIGHTNESS
+        # Only support brightness for now; channels with a color_type (e.g. RGB)
+        # are treated as brightness-only until full colour support is implemented.
+        self.supported_color_modes = {ColorMode.BRIGHTNESS}
+        self.color_mode = ColorMode.BRIGHTNESS
 
     @property
     def brightness(self) -> int:
