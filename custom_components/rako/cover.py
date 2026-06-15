@@ -41,13 +41,13 @@ async def async_setup_entry(
 
     covers: list[Entity] = []
 
-    # Get all rooms and find BLIND type rooms
+    # Get all rooms and find cover-type rooms (blinds and curtains)
     rooms = await hub_client.get_rooms()
     for room in rooms:
-        if room.type == "BLIND":
+        if room.type in ("BLIND", "CURTAIN"):
             room_levels = levels_lookup.get(room.id, None)
             if room_levels is not None:
-                # Create cover entities for each channel in blind rooms
+                # Create cover entities for each channel in cover rooms
                 for channel in room.channels:
                     channel_level = room_levels.get(channel.id, None)
                     if channel_level is not None:
