@@ -53,6 +53,53 @@ async def test_setup_entry_discovers_covers(
     assert len(covers) == 2
 
 
+async def test_setup_entry_discovers_curtain_rooms(
+    hass: HomeAssistant,
+    mock_hub_client,
+    mock_config_entry,
+) -> None:
+    """Rooms reported as type 'CURTAIN' should also produce cover entities.
+
+    Regression test for issue #23: some hubs report curtain rooms with
+    room.type == "CURTAIN" rather than "BLIND", which previously caused the
+    cover entity to disappear.
+    """
+    from rakopy.model import Channel, Level, Room
+
+    from tests.conftest import make_channel_level
+
+    curtain_channel = Channel(
+        id=1,
+        title="Curtain",
+        type="BLIND",
+        color_type=None,
+        color_title=None,
+        multi_channel_component=None,
+    )
+    curtain_room = Room(
+        id=13,
+        title="Curtain",
+        type="CURTAIN",
+        mode="NORMAL",
+        channels=[curtain_channel],
+        scenes=[],
+    )
+    curtain_level = Level(
+        room_id=13,
+        current_scene_id=0,
+        channel_levels=[make_channel_level(1, 0)],
+    )
+    mock_hub_client.get_rooms = AsyncMock(return_value=[curtain_room])
+    mock_hub_client.get_levels = AsyncMock(return_value=[curtain_level])
+
+    added: list = []
+    await async_setup_entry(hass, mock_config_entry, lambda entities, _: added.extend(entities))
+
+    covers = [e for e in added if isinstance(e, RakoCoverEntity)]
+    assert len(covers) == 1
+    assert covers[0]._room.type == "CURTAIN"
+
+
 async def test_setup_entry_skips_light_rooms(
     hass: HomeAssistant,
     mock_hub_client,
