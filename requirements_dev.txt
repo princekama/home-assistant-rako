@@ -1,5 +1,5 @@
 homeassistant>=2024.10.0
-rakopy==0.0.6
+rakopy==0.0.7
 
 # Testing
 pytest
