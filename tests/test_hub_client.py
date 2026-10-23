@@ -270,6 +270,54 @@ async def test_subscribe_scene_changed_updates_scene(hass: HomeAssistant) -> Non
     assert scene.current_option == 2
 
 
+async def test_subscribe_scene_off_turns_off_room_lights(hass: HomeAssistant) -> None:
+    """SceneChangedEvent for scene 0 should turn off every light in that room only."""
+    client = MagicMock()
+    client.hub_id = MOCK_HUB_ID
+
+    room_light = MagicMock()
+    room_light.brightness = 200
+    channel_light = MagicMock()
+    channel_light.brightness = 100
+    other_room_light = MagicMock()
+    other_room_light.brightness = 150
+    client._light_map = {
+        f"{MOCK_HUB_ID}_1_0": room_light,
+        f"{MOCK_HUB_ID}_1_2": channel_light,
+        f"{MOCK_HUB_ID}_11_0": other_room_light,
+    }
+    client._scene_map = {}
+    client._cover_map = {}
+
+    event = SceneChangedEvent(
+        room_id=1, channel_id=0, scene_id=0, active_scene_id=0
+    )
+    await _run_subscribe_with_events(client, [event])
+
+    assert room_light.brightness == 0
+    assert channel_light.brightness == 0
+    assert other_room_light.brightness == 150
+
+
+async def test_subscribe_scene_on_leaves_lights_unchanged(hass: HomeAssistant) -> None:
+    """SceneChangedEvent for a non-zero scene should not change light brightness."""
+    client = MagicMock()
+    client.hub_id = MOCK_HUB_ID
+
+    room_light = MagicMock()
+    room_light.brightness = 0
+    client._light_map = {f"{MOCK_HUB_ID}_1_0": room_light}
+    client._scene_map = {}
+    client._cover_map = {}
+
+    event = SceneChangedEvent(
+        room_id=1, channel_id=0, scene_id=2, active_scene_id=2
+    )
+    await _run_subscribe_with_events(client, [event])
+
+    assert room_light.brightness == 0
+
+
 async def test_subscribe_handles_exception_gracefully(hass: HomeAssistant) -> None:
     """An exception inside the event loop should be caught and logged."""
     client = MagicMock()

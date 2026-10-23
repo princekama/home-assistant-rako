@@ -120,5 +120,13 @@ async def subscribe_to_events(hub_client: HubClient) -> None:
                 if unique_id in hub_client._scene_map:
                     hub_client._scene_map[unique_id].current_option = event.active_scene_id
 
+                # Scene 0 is "off" (e.g. from a keypad), and the hub does not
+                # push level events for it, so turn off the room's lights here
+                if event.active_scene_id == 0:
+                    light_prefix = f"{unique_id}_"
+                    for light_unique_id, light in hub_client._light_map.items():
+                        if light_unique_id.startswith(light_prefix):
+                            light.brightness = 0
+
         except Exception as e:
             _LOGGER.exception("Unexpected exception: %s", repr(e))
