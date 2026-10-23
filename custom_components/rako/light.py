@@ -144,7 +144,12 @@ class RakoLightEntity(LightEntity):
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn off the light."""
         if not self._channel:
-            await self._hub_client.set_scene(self._room.id, 0, 0)
+            try:
+                await self._hub_client.set_scene(self._room.id, 0, 0)
+                self.brightness = 0
+
+            except (SendCommandError):
+                _LOGGER.error("An error occurred while updating the Rako Light")
         else:
             await self.async_turn_on(brightness=0)
 
