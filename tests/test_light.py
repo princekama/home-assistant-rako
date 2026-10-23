@@ -207,9 +207,25 @@ async def test_turn_off_room_level(mock_hub_client) -> None:
     room = Room(id=3, title="R", type="LIGHT", mode="NORMAL", channels=[], scenes=[])
     light = _make_light(mock_hub_client, room=room, channel=None, brightness=200)
 
-    await light.async_turn_off()
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(light, "async_write_ha_state", lambda: None)
+        await light.async_turn_off()
 
     mock_hub_client.set_scene.assert_awaited_once_with(3, 0, 0)
+    assert light._brightness == 0
+    assert light.is_on is False
+
+
+async def test_turn_off_room_level_send_command_error(mock_hub_client) -> None:
+    """SendCommandError during room-level turn off should be caught and leave state unchanged."""
+    mock_hub_client.set_scene = AsyncMock(side_effect=SendCommandError("fail"))
+    room = Room(id=3, title="R", type="LIGHT", mode="NORMAL", channels=[], scenes=[])
+    light = _make_light(mock_hub_client, room=room, channel=None, brightness=200)
+
+    # Should not raise
+    await light.async_turn_off()
+
+    assert light._brightness == 200
 
 
 async def test_turn_off_channel_level(mock_hub_client) -> None:
