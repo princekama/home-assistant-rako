@@ -113,4 +113,10 @@ class RakoSceneEntity(SelectEntity):
 
     async def async_select_option(self, option: str) -> None:
         """Change the selected option."""
-        await self._hub_client.set_scene(self._room.id, 0, self._reverse_lookup[option])
+        scene_id = self._reverse_lookup[option]
+        await self._hub_client.set_scene(self._room.id, 0, scene_id)
+        # The hub does not reliably push events back after a scene command, so
+        # update our own state and then re-read the room's channel levels so the
+        # light entities reflect what the scene actually did.
+        self.current_option = scene_id
+        await self._hub_client.refresh_room(self._room.id)
