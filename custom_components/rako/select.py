@@ -117,6 +117,6 @@ class RakoSceneEntity(SelectEntity):
         await self._hub_client.set_scene(self._room.id, 0, scene_id)
         # The hub does not reliably push events back after a scene command, so
         # update our own state and then re-read the room's channel levels so the
-        # light entities reflect what the scene actually did.
+        # light and cover entities reflect what the scene actually did.
         self.current_option = scene_id
         await self._hub_client.refresh_room(self._room.id)

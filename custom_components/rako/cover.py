@@ -16,7 +16,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from rakopy.errors import SendCommandError
 from rakopy.model import Channel, ChannelLevel, Room
-from .hub_client import HubClient
+from .hub_client import HubClient, effective_level
 from .model import RakoDomainEntryData
 
 _LOGGER = logging.getLogger(__name__)
@@ -86,10 +86,7 @@ class RakoCoverEntity(CoverEntity):
         self._channel = channel
         
         # Set initial position from current level
-        if channel_level.target_level is not None:
-            self._current_position = self._rako_to_ha_position(channel_level.target_level)
-        else:
-            self._current_position = self._rako_to_ha_position(channel_level.current_level)
+        self._current_position = self._rako_to_ha_position(effective_level(channel_level))
         
         # Set supported features
         self._attr_supported_features = (

@@ -15,6 +15,13 @@ from .model import RakoDomainEntryData
 _LOGGER = logging.getLogger(__name__)
 
 
+def effective_level(level) -> int:
+    """Return a channel's target level if it has one, otherwise its current level."""
+    if level.target_level is not None:
+        return level.target_level
+    return level.current_level
+
+
 class HubClient(Hub):
     """Rako Hub Client."""
 
@@ -76,26 +83,27 @@ class HubClient(Hub):
             del self._scene_map[select.unique_id]
             await self._try_cancel_event_listener_task()
 
-    async def refresh_room(self, room_id) -> None:
-        """Re-read a room's channel levels from the hub and push them to the lights."""
+    async def refresh_room(self, room_id: int) -> None:
+        """Re-read a room's channel levels from the hub and push them to its lights and covers."""
         try:
-            levels = await self.get_levels()
-        except Exception as e:
+            levels = await self.get_levels(room_id)
+        except (OSError, ValueError) as e:
             _LOGGER.warning("Could not refresh levels for room %s: %s", room_id, repr(e))
             return
 
+        hub_id = self.hub_id
         for level in levels:
             if level.room_id != room_id:
                 continue
             for channel_level in level.channel_levels:
-                unique_id = f"{self.hub_id}_{level.room_id}_{channel_level.channel_id}"
+                unique_id = f"{hub_id}_{room_id}_{channel_level.channel_id}"
                 light = self._light_map.get(unique_id)
-                if light is None or getattr(light, "hass", None) is None:
-                    continue
-                if channel_level.target_level is not None:
-                    light.brightness = channel_level.target_level
-                else:
-                    light.brightness = channel_level.current_level
+                if light is not None and getattr(light, "hass", None) is not None:
+                    light.brightness = effective_level(channel_level)
+                cover = self._cover_map.get(unique_id)
+                if cover is not None and getattr(cover, "hass", None) is not None:
+                    cover.current_cover_position = effective_level(channel_level)
+            break
 
     def _try_start_event_listener_task(self) -> None:
         """Start the event listener task."""
@@ -124,17 +132,11 @@ async def subscribe_to_events(hub_client: HubClient) -> None:
 
                 # Handle cover entities (blinds use level for position)
                 if unique_id in hub_client._cover_map:
-                    if event.target_level is not None:
-                        hub_client._cover_map[unique_id].current_cover_position = event.target_level
-                    else:
-                        hub_client._cover_map[unique_id].current_cover_position = event.current_level
+                    hub_client._cover_map[unique_id].current_cover_position = effective_level(event)
 
                 # Handle light entities
                 if unique_id in hub_client._light_map:
-                    if event.target_level is not None:
-                        hub_client._light_map[unique_id].brightness = event.target_level
-                    else:
-                        hub_client._light_map[unique_id].brightness = event.current_level
+                    hub_client._light_map[unique_id].brightness = effective_level(event)
 
             elif event and isinstance(event, SceneChangedEvent):
                 unique_id = f"{hub_client.hub_id}_{event.room_id}"
@@ -148,6 +150,10 @@ async def subscribe_to_events(hub_client: HubClient) -> None:
                     for light_unique_id, light in hub_client._light_map.items():
                         if light_unique_id.startswith(light_prefix):
                             light.brightness = 0
+                else:
+                    # Other scenes (from HA, a keypad or the app) don't reliably
+                    # push level events either, so re-read the room's levels
+                    await hub_client.refresh_room(event.room_id)
 
         except Exception as e:
             _LOGGER.exception("Unexpected exception: %s", repr(e))

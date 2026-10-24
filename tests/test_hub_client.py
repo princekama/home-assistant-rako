@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
+import pytest
 from homeassistant.core import HomeAssistant
 
 from rakopy.model import Level, LevelChangedEvent, SceneChangedEvent
@@ -256,6 +257,8 @@ async def test_subscribe_scene_changed_updates_scene(hass: HomeAssistant) -> Non
     client = MagicMock()
     client.hub_id = MOCK_HUB_ID
 
+    client.refresh_room = AsyncMock()
+
     scene = MagicMock()
     uid = f"{MOCK_HUB_ID}_1"
     client._scene_map = {uid: scene}
@@ -274,6 +277,7 @@ async def test_subscribe_scene_off_turns_off_room_lights(hass: HomeAssistant) ->
     """SceneChangedEvent for scene 0 should turn off every light in that room only."""
     client = MagicMock()
     client.hub_id = MOCK_HUB_ID
+    client.refresh_room = AsyncMock()
 
     room_light = MagicMock()
     room_light.brightness = 200
@@ -297,12 +301,15 @@ async def test_subscribe_scene_off_turns_off_room_lights(hass: HomeAssistant) ->
     assert room_light.brightness == 0
     assert channel_light.brightness == 0
     assert other_room_light.brightness == 150
+    # Scene 0 is handled locally; re-reading levels could return stale values
+    client.refresh_room.assert_not_awaited()
 
 
-async def test_subscribe_scene_on_leaves_lights_unchanged(hass: HomeAssistant) -> None:
-    """SceneChangedEvent for a non-zero scene should not change light brightness."""
+async def test_subscribe_scene_on_refreshes_room(hass: HomeAssistant) -> None:
+    """SceneChangedEvent for a non-zero scene should re-read that room's levels."""
     client = MagicMock()
     client.hub_id = MOCK_HUB_ID
+    client.refresh_room = AsyncMock()
 
     room_light = MagicMock()
     room_light.brightness = 0
@@ -315,6 +322,8 @@ async def test_subscribe_scene_on_leaves_lights_unchanged(hass: HomeAssistant) -
     )
     await _run_subscribe_with_events(client, [event])
 
+    client.refresh_room.assert_awaited_once_with(1)
+    # Brightness comes from the refreshed levels, not from the scene event itself
     assert room_light.brightness == 0
 
 
@@ -400,9 +409,36 @@ async def test_refresh_room_updates_room_lights(hass: HomeAssistant) -> None:
 
     await client.refresh_room(1)
 
+    client.get_levels.assert_awaited_once_with(1)
     # target_level is preferred when present, current_level otherwise
     assert room_light.brightness == 128
     assert channel_light.brightness == 50
+
+
+async def test_refresh_room_updates_room_covers(hass: HomeAssistant) -> None:
+    """refresh_room should push the room's channel levels to its covers too."""
+    levels = [
+        Level(
+            room_id=2,
+            current_scene_id=1,
+            channel_levels=[
+                make_channel_level(1, 0, target_level=255),
+                make_channel_level(2, 128),
+            ],
+        ),
+    ]
+    client = _make_refresh_client(hass, levels)
+    blind = MagicMock()
+    curtain = MagicMock()
+    client._cover_map = {
+        f"{MOCK_HUB_ID}_2_1": blind,
+        f"{MOCK_HUB_ID}_2_2": curtain,
+    }
+
+    await client.refresh_room(2)
+
+    assert blind.current_cover_position == 255
+    assert curtain.current_cover_position == 128
 
 
 async def test_refresh_room_only_touches_requested_room(hass: HomeAssistant) -> None:
@@ -450,7 +486,7 @@ async def test_refresh_room_skips_unregistered_and_unadded_lights(hass: HomeAssi
 async def test_refresh_room_handles_get_levels_failure(hass: HomeAssistant) -> None:
     """A failure reading levels from the hub should be logged, not raised."""
     client = _make_refresh_client(hass, [])
-    client.get_levels = AsyncMock(side_effect=RuntimeError("hub unreachable"))
+    client.get_levels = AsyncMock(side_effect=ConnectionResetError("hub unreachable"))
     light = MagicMock()
     light.brightness = 42
     client._light_map = {f"{MOCK_HUB_ID}_1_0": light}
@@ -458,3 +494,12 @@ async def test_refresh_room_handles_get_levels_failure(hass: HomeAssistant) -> N
     await client.refresh_room(1)
 
     assert light.brightness == 42
+
+
+async def test_refresh_room_propagates_unexpected_errors(hass: HomeAssistant) -> None:
+    """Errors other than connection or parse failures should not be swallowed."""
+    client = _make_refresh_client(hass, [])
+    client.get_levels = AsyncMock(side_effect=AttributeError("bug"))
+
+    with pytest.raises(AttributeError):
+        await client.refresh_room(1)
