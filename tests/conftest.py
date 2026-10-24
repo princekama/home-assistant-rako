@@ -202,6 +202,7 @@ def mock_hub_client(
     client.get_rooms = AsyncMock(return_value=mock_all_rooms)
     client.set_level = AsyncMock()
     client.set_scene = AsyncMock()
+    client.refresh_room = AsyncMock()
     client.add_light = AsyncMock()
     client.remove_light = AsyncMock()
     client.add_cover = AsyncMock()
