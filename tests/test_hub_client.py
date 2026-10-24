@@ -305,8 +305,11 @@ async def test_subscribe_scene_off_turns_off_room_lights(hass: HomeAssistant) ->
     client.refresh_room.assert_not_awaited()
 
 
-async def test_subscribe_scene_on_refreshes_room(hass: HomeAssistant) -> None:
-    """SceneChangedEvent for a non-zero scene should re-read that room's levels."""
+async def test_subscribe_scene_on_does_not_query_hub(hass: HomeAssistant) -> None:
+    """SceneChangedEvent for a non-zero scene must not query the hub from the listener.
+
+    A hub query here blocked commands on a live install (issue #29).
+    """
     client = MagicMock()
     client.hub_id = MOCK_HUB_ID
     client.refresh_room = AsyncMock()
@@ -322,8 +325,7 @@ async def test_subscribe_scene_on_refreshes_room(hass: HomeAssistant) -> None:
     )
     await _run_subscribe_with_events(client, [event])
 
-    client.refresh_room.assert_awaited_once_with(1)
-    # Brightness comes from the refreshed levels, not from the scene event itself
+    client.refresh_room.assert_not_awaited()
     assert room_light.brightness == 0
 
 
@@ -409,7 +411,8 @@ async def test_refresh_room_updates_room_lights(hass: HomeAssistant) -> None:
 
     await client.refresh_room(1)
 
-    client.get_levels.assert_awaited_once_with(1)
+    # All-rooms query, the one used at setup; see refresh_room
+    client.get_levels.assert_awaited_once_with()
     # target_level is preferred when present, current_level otherwise
     assert room_light.brightness == 128
     assert channel_light.brightness == 50
@@ -503,3 +506,67 @@ async def test_refresh_room_propagates_unexpected_errors(hass: HomeAssistant) ->
 
     with pytest.raises(AttributeError):
         await client.refresh_room(1)
+
+
+async def test_refresh_room_times_out_and_reconnects(hass: HomeAssistant) -> None:
+    """A query the hub never answers should time out and drop the connection."""
+    client = _make_refresh_client(hass, [])
+
+    async def never_answers():
+        await asyncio.sleep(3600)
+
+    client.get_levels = never_answers
+    writer = MagicMock()
+    client._reader = MagicMock()
+    client._writer = writer
+    light = MagicMock()
+    light.brightness = 42
+    client._light_map = {f"{MOCK_HUB_ID}_1_0": light}
+
+    with patch("custom_components.rako.hub_client.REFRESH_TIMEOUT", 0.01):
+        await client.refresh_room(1)
+
+    writer.close.assert_called_once()
+    assert client._reader is None
+    assert client._writer is None
+    assert light.brightness == 42
+
+
+async def test_close_connection_without_connection(hass: HomeAssistant) -> None:
+    """Closing when no connection was ever opened should be a no-op."""
+    client = _make_hub_client(hass)
+    client._reader = None
+    client._writer = None
+
+    client._close_connection()
+
+    assert client._writer is None
+
+
+# ---------------------------------------------------------------------------
+# _query / _send logging wrappers
+# ---------------------------------------------------------------------------
+
+async def test_query_delegates_to_rakopy(hass: HomeAssistant) -> None:
+    """_query should pass through to rakopy and return its result."""
+    client = _make_hub_client(hass)
+    func = MagicMock()
+
+    with patch(
+        "custom_components.rako.hub_client.Hub._query", new_callable=AsyncMock, return_value=["x"]
+    ) as mock_query:
+        result = await client._query("LEVEL", func, 3)
+
+    mock_query.assert_awaited_once_with("LEVEL", func, 3)
+    assert result == ["x"]
+
+
+async def test_send_delegates_to_rakopy(hass: HomeAssistant) -> None:
+    """_send should pass through to rakopy."""
+    client = _make_hub_client(hass)
+    request = {"name": "send"}
+
+    with patch("custom_components.rako.hub_client.Hub._send", new_callable=AsyncMock) as mock_send:
+        await client._send(request)
+
+    mock_send.assert_awaited_once_with(request)
