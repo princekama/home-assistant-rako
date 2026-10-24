@@ -76,6 +76,27 @@ class HubClient(Hub):
             del self._scene_map[select.unique_id]
             await self._try_cancel_event_listener_task()
 
+    async def refresh_room(self, room_id) -> None:
+        """Re-read a room's channel levels from the hub and push them to the lights."""
+        try:
+            levels = await self.get_levels()
+        except Exception as e:
+            _LOGGER.warning("Could not refresh levels for room %s: %s", room_id, repr(e))
+            return
+
+        for level in levels:
+            if level.room_id != room_id:
+                continue
+            for channel_level in level.channel_levels:
+                unique_id = f"{self.hub_id}_{level.room_id}_{channel_level.channel_id}"
+                light = self._light_map.get(unique_id)
+                if light is None or getattr(light, "hass", None) is None:
+                    continue
+                if channel_level.target_level is not None:
+                    light.brightness = channel_level.target_level
+                else:
+                    light.brightness = channel_level.current_level
+
     def _try_start_event_listener_task(self) -> None:
         """Start the event listener task."""
         total_entities = len(self._light_map) + len(self._scene_map) + len(self._cover_map)
