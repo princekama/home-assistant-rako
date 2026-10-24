@@ -14,6 +14,10 @@ from .model import RakoDomainEntryData
 
 _LOGGER = logging.getLogger(__name__)
 
+# rakopy reads replies with no timeout while holding its connection lock, so a
+# query the hub never answers would block every later command
+REFRESH_TIMEOUT = 5
+
 
 def effective_level(level) -> int:
     """Return a channel's target level if it has one, otherwise its current level."""
@@ -83,10 +87,40 @@ class HubClient(Hub):
             del self._scene_map[select.unique_id]
             await self._try_cancel_event_listener_task()
 
+    async def _query(self, query_type: str, func, room_id: int = None):
+        """Run a rakopy query, logging the request for debugging."""
+        _LOGGER.debug("Querying hub: %s room %s", query_type, room_id)
+        result = await super()._query(query_type, func, room_id)
+        _LOGGER.debug("Hub answered %s room %s", query_type, room_id)
+        return result
+
+    async def _send(self, request) -> None:
+        """Send a rakopy command, logging the request for debugging."""
+        _LOGGER.debug("Sending to hub: %s", request)
+        await super()._send(request)
+        _LOGGER.debug("Hub acknowledged: %s", request)
+
+    def _close_connection(self) -> None:
+        """Drop the command connection so the next call reconnects.
+
+        After an abandoned query the hub's late reply would otherwise be read
+        as the reply to the next command.
+        """
+        if self._writer is not None:
+            self._writer.close()
+        self._reader = None
+        self._writer = None
+
     async def refresh_room(self, room_id: int) -> None:
         """Re-read a room's channel levels from the hub and push them to its lights and covers."""
         try:
-            levels = await self.get_levels(room_id)
+            # Query all rooms rather than get_levels(room_id): the all-rooms
+            # query is the one the integration has always used at setup
+            levels = await asyncio.wait_for(self.get_levels(), REFRESH_TIMEOUT)
+        except TimeoutError:
+            _LOGGER.warning("Timed out refreshing levels for room %s, reconnecting", room_id)
+            self._close_connection()
+            return
         except (OSError, ValueError) as e:
             _LOGGER.warning("Could not refresh levels for room %s: %s", room_id, repr(e))
             return
@@ -150,10 +184,6 @@ async def subscribe_to_events(hub_client: HubClient) -> None:
                     for light_unique_id, light in hub_client._light_map.items():
                         if light_unique_id.startswith(light_prefix):
                             light.brightness = 0
-                else:
-                    # Other scenes (from HA, a keypad or the app) don't reliably
-                    # push level events either, so re-read the room's levels
-                    await hub_client.refresh_room(event.room_id)
 
         except Exception as e:
             _LOGGER.exception("Unexpected exception: %s", repr(e))
