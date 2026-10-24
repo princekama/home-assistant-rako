@@ -131,22 +131,47 @@ def test_reverse_lookup_dict(mock_hub_client) -> None:
 # async_select_option
 # ---------------------------------------------------------------------------
 
-async def test_select_option(mock_hub_client) -> None:
+async def test_select_option(mock_hub_client, monkeypatch) -> None:
     """async_select_option should call set_scene with the correct scene id."""
     entity = _make_scene_entity(mock_hub_client)
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
 
     await entity.async_select_option("Scene 2")
 
     mock_hub_client.set_scene.assert_awaited_once_with(1, 0, 2)
 
 
-async def test_select_option_off(mock_hub_client) -> None:
+async def test_select_option_off(mock_hub_client, monkeypatch) -> None:
     """Selecting 'Off' should send scene id 0."""
     entity = _make_scene_entity(mock_hub_client)
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
 
     await entity.async_select_option("Off")
 
     mock_hub_client.set_scene.assert_awaited_once_with(1, 0, 0)
+
+
+async def test_select_option_updates_state(mock_hub_client, monkeypatch) -> None:
+    """After selecting a scene the entity should report it and write HA state."""
+    entity = _make_scene_entity(mock_hub_client, current_scene_id=0)
+    written: list[bool] = []
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: written.append(True))
+
+    await entity.async_select_option("Scene 2")
+
+    assert entity._current_scene_id == 2
+    assert entity.current_option == "Scene 2"
+    assert written == [True]
+
+
+async def test_select_option_refreshes_room_lights(mock_hub_client, monkeypatch) -> None:
+    """Selecting a scene should re-read the room's light levels from the hub."""
+    entity = _make_scene_entity(mock_hub_client)
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+
+    await entity.async_select_option("Scene 1")
+
+    mock_hub_client.refresh_room.assert_awaited_once_with(1)
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from rakopy.errors import SendCommandError
 from rakopy.model import Channel, ChannelLevel, Room
-from .hub_client import HubClient
+from .hub_client import HubClient, effective_level
 from .model import RakoDomainEntryData
 
 _LOGGER = logging.getLogger(__name__)
@@ -89,10 +89,7 @@ class RakoLightEntity(LightEntity):
         self._hub_client = hub_client
         self._room = room
         self._channel = channel
-        if channel_level.target_level != None:
-            self._brightness = channel_level.target_level
-        else:
-            self._brightness = channel_level.current_level
+        self._brightness = effective_level(channel_level)
         # Only support brightness for now; channels with a color_type (e.g. RGB)
         # are treated as brightness-only until full colour support is implemented.
         self.supported_color_modes = {ColorMode.BRIGHTNESS}
