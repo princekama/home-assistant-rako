@@ -8,7 +8,15 @@ from homeassistant.core import HomeAssistant
 
 from rakopy.model import Level, LevelChangedEvent, SceneChangedEvent
 
-from custom_components.rako.hub_client import HubClient, subscribe_to_events
+import socket
+
+from custom_components.rako.hub_client import (
+    EVENT_RECONNECT_DELAY,
+    HubClient,
+    ResyncRequested,
+    _enable_keepalive,
+    subscribe_to_events,
+)
 from tests.conftest import MOCK_HOST, MOCK_HUB_ID, MOCK_NAME, make_channel_level
 
 
@@ -25,6 +33,18 @@ def _make_hub_client(hass: HomeAssistant) -> HubClient:
             entry_id="test_entry_id",
             hass=hass,
         )
+    return client
+
+
+def _make_live_client(hass: HomeAssistant) -> HubClient:
+    """HubClient whose hub_id resolves, for driving the event handlers for real."""
+    client = _make_hub_client(hass)
+    mock_entry = MagicMock()
+    mock_entry.runtime_data = {"hub_id": MOCK_HUB_ID}
+    hass.config_entries.async_get_entry = MagicMock(return_value=mock_entry)
+    client._light_map = {}
+    client._cover_map = {}
+    client._scene_map = {}
     return client
 
 
@@ -197,8 +217,7 @@ async def _run_subscribe_with_events(hub_client, events):
 
 async def test_subscribe_level_changed_updates_light(hass: HomeAssistant) -> None:
     """LevelChangedEvent should update the matching light's brightness."""
-    client = MagicMock()
-    client.hub_id = MOCK_HUB_ID
+    client = _make_live_client(hass)
 
     light = MagicMock()
     uid = f"{MOCK_HUB_ID}_1_1"
@@ -216,8 +235,7 @@ async def test_subscribe_level_changed_updates_light(hass: HomeAssistant) -> Non
 
 async def test_subscribe_level_changed_uses_current_when_no_target(hass: HomeAssistant) -> None:
     """LevelChangedEvent with target_level=None should use current_level."""
-    client = MagicMock()
-    client.hub_id = MOCK_HUB_ID
+    client = _make_live_client(hass)
 
     light = MagicMock()
     uid = f"{MOCK_HUB_ID}_1_1"
@@ -235,8 +253,7 @@ async def test_subscribe_level_changed_uses_current_when_no_target(hass: HomeAss
 
 async def test_subscribe_level_changed_updates_cover(hass: HomeAssistant) -> None:
     """LevelChangedEvent should update the matching cover's position."""
-    client = MagicMock()
-    client.hub_id = MOCK_HUB_ID
+    client = _make_live_client(hass)
 
     cover = MagicMock()
     uid = f"{MOCK_HUB_ID}_2_1"
@@ -270,7 +287,7 @@ async def test_subscribe_scene_changed_applies_scene(hass: HomeAssistant) -> Non
     )
     await _run_subscribe_with_events(client, [event])
 
-    client.apply_scene.assert_called_once_with(1, 0, 2)
+    client.apply_scene.assert_called_once_with(1, 0, 2, 2)
 
 
 async def test_subscribe_scene_off_passes_channel(hass: HomeAssistant) -> None:
@@ -287,9 +304,22 @@ async def test_subscribe_scene_off_passes_channel(hass: HomeAssistant) -> None:
     )
     await _run_subscribe_with_events(client, [event])
 
-    client.apply_scene.assert_called_once_with(1, 2, 0)
+    client.apply_scene.assert_called_once_with(1, 2, 0, 0)
     # Scene 0 is handled locally; re-reading levels could return stale values
     client.refresh_room.assert_not_awaited()
+
+
+async def test_subscribe_scene_custom_levels_passes_both_scene_ids(hass: HomeAssistant) -> None:
+    """Explicit levels arrive as scene -1 with the room's active scene; both reach apply_scene."""
+    client = MagicMock()
+    client.hub_id = MOCK_HUB_ID
+
+    event = SceneChangedEvent(
+        room_id=1, channel_id=0, scene_id=-1, active_scene_id=2
+    )
+    await _run_subscribe_with_events(client, [event])
+
+    client.apply_scene.assert_called_once_with(1, 0, -1, 2)
 
 
 async def test_subscribe_scene_on_does_not_query_hub(hass: HomeAssistant) -> None:
@@ -297,8 +327,7 @@ async def test_subscribe_scene_on_does_not_query_hub(hass: HomeAssistant) -> Non
 
     A hub query here blocked commands on a live install (issue #29).
     """
-    client = MagicMock()
-    client.hub_id = MOCK_HUB_ID
+    client = _make_live_client(hass)
     client.refresh_room = AsyncMock()
 
     room_light = MagicMock()
@@ -313,7 +342,8 @@ async def test_subscribe_scene_on_does_not_query_hub(hass: HomeAssistant) -> Non
     await _run_subscribe_with_events(client, [event])
 
     client.refresh_room.assert_not_awaited()
-    assert room_light.brightness == 0
+    # The room is on in its scene, at a level the hub does not report
+    room_light.assume_on.assert_called_once_with()
 
 
 async def test_subscribe_handles_exception_gracefully(hass: HomeAssistant) -> None:
@@ -632,13 +662,17 @@ def test_apply_scene_channel_off_closes_that_cover(hass: HomeAssistant) -> None:
     assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 1
 
 
-def test_apply_scene_non_zero_updates_select_only(hass: HomeAssistant) -> None:
-    """A non-zero scene updates the room's select and leaves levels to refresh_room."""
+def test_apply_scene_non_zero_updates_select_and_assumes_lights_on(hass: HomeAssistant) -> None:
+    """A non-zero scene updates the room's select and shows its lights on at their last level.
+
+    Channel levels are left to refresh_room; covers are not touched.
+    """
     client = _make_apply_client(hass)
 
     client.apply_scene(1, 0, 3)
 
     assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 3
+    client._light_map[f"{MOCK_HUB_ID}_1_0"].assume_on.assert_called_once_with()
     assert client._light_map[f"{MOCK_HUB_ID}_1_0"].brightness == 99
     assert client._cover_map[f"{MOCK_HUB_ID}_1_3"].current_cover_position == 100
     assert client._scene_map[f"{MOCK_HUB_ID}_2"].current_option == 1
@@ -666,3 +700,322 @@ def test_apply_scene_without_config_entry_does_nothing(hass: HomeAssistant) -> N
     client.apply_scene(1, 0, 0)
 
     assert client._light_map[f"{MOCK_HUB_ID}_1_0"].brightness == 99
+
+
+# ---------------------------------------------------------------------------
+# Scene-aware level handling
+# ---------------------------------------------------------------------------
+
+def test_set_channel_level_ignores_reset_while_room_in_scene(hass: HomeAssistant) -> None:
+    """A level of 0 for a room in a scene is the hub resetting its tracker, not a light going off."""
+    client = _make_live_client(hass)
+    light = MagicMock()
+    light.brightness = 200
+    client._light_map = {f"{MOCK_HUB_ID}_1_1": light}
+    client._room_scene = {1: 1}
+
+    client.set_channel_level(1, 1, 0)
+    assert light.brightness == 200
+
+    # a real level still wins
+    client.set_channel_level(1, 1, 90)
+    assert light.brightness == 90
+
+
+def test_set_channel_level_applies_zero_outside_a_scene(hass: HomeAssistant) -> None:
+    """With explicit levels (scene -1) or the room off, a 0 level turns the light off."""
+    client = _make_live_client(hass)
+    light = MagicMock()
+    light.brightness = 200
+    client._light_map = {f"{MOCK_HUB_ID}_1_1": light}
+
+    client._room_scene = {1: -1}
+    client.set_channel_level(1, 1, 0)
+    assert light.brightness == 0
+
+    light.brightness = 200
+    client._room_scene = {}
+    client.set_channel_level(1, 1, 0)
+    assert light.brightness == 0
+
+
+def test_apply_scene_tracks_room_scene_and_updates_entities(hass: HomeAssistant) -> None:
+    """A room scene updates the select, turns the room's lights on or off, and is remembered."""
+    client = _make_apply_client(hass)
+    other_light = client._light_map[f"{MOCK_HUB_ID}_2_0"]
+
+    client.apply_scene(1, 0, 3)
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 3
+    for channel in (0, 1, 2):
+        client._light_map[f"{MOCK_HUB_ID}_1_{channel}"].assume_on.assert_called_once_with()
+    other_light.assume_on.assert_not_called()
+    assert client._room_scene[1] == 3
+
+    client.apply_scene(1, 0, 0)
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 0
+    for channel in (0, 1, 2):
+        assert client._light_map[f"{MOCK_HUB_ID}_1_{channel}"].brightness == 0
+    assert other_light.brightness == 99
+    assert client._room_scene[1] == 0
+
+
+def test_apply_scene_custom_levels_leaves_lights_to_level_events(hass: HomeAssistant) -> None:
+    """Scene -1 (explicit levels) keeps the select on the active scene and touches no light."""
+    client = _make_apply_client(hass)
+    light = client._light_map[f"{MOCK_HUB_ID}_1_0"]
+
+    client.apply_scene(1, 0, -1, 2)
+
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 2
+    light.assume_on.assert_not_called()
+    assert light.brightness == 99
+    assert client._room_scene[1] == -1
+
+
+def test_apply_scene_channel_scene_does_not_track_room_scene(hass: HomeAssistant) -> None:
+    """A channel's own scene (a blind's open, or one channel off) is not the room's scene."""
+    client = _make_apply_client(hass)
+    client._room_scene = {1: 2}
+
+    client.apply_scene(1, 3, 1)
+    client.apply_scene(1, 2, 0)
+
+    assert client._room_scene[1] == 2
+
+
+def test_apply_room_level_assumes_on_when_hub_reports_zero_in_scene(hass: HomeAssistant) -> None:
+    """A room in a scene whose channels all read 0 is on at an unknown level."""
+    client = _make_live_client(hass)
+    scene = MagicMock()
+    room_light = MagicMock()
+    channel_light = MagicMock()
+    cover = MagicMock()
+    cover.current_cover_position = 40
+    client._scene_map = {f"{MOCK_HUB_ID}_1": scene}
+    client._light_map = {f"{MOCK_HUB_ID}_1_0": room_light, f"{MOCK_HUB_ID}_1_1": channel_light}
+    client._cover_map = {f"{MOCK_HUB_ID}_1_2": cover}
+
+    client._apply_room_level(
+        Level(room_id=1, current_scene_id=2, channel_levels=[
+            make_channel_level(0, 0), make_channel_level(1, 0), make_channel_level(2, 0),
+        ])
+    )
+
+    assert scene.current_option == 2
+    room_light.assume_on.assert_called_once_with()
+    channel_light.assume_on.assert_called_once_with()
+    # the hub does not know the cover's position either, so it is left alone
+    assert cover.current_cover_position == 40
+    assert client._room_scene[1] == 2
+
+
+def test_apply_room_level_off_and_custom_use_levels(hass: HomeAssistant) -> None:
+    """Scene 0 and scene -1 take the hub's levels as they are; -1 does not touch the select."""
+    client = _make_live_client(hass)
+    scene = MagicMock()
+    scene.current_option = 1
+    light = MagicMock()
+    light.brightness = 200
+    client._scene_map = {f"{MOCK_HUB_ID}_1": scene}
+    client._light_map = {f"{MOCK_HUB_ID}_1_0": light}
+
+    client._apply_room_level(Level(room_id=1, current_scene_id=0, channel_levels=[make_channel_level(0, 0)]))
+    assert scene.current_option == 0
+    assert light.brightness == 0
+
+    client._apply_room_level(Level(room_id=1, current_scene_id=-1, channel_levels=[make_channel_level(0, 77)]))
+    assert scene.current_option == 0
+    assert light.brightness == 77
+    assert client._room_scene[1] == -1
+
+
+async def test_resync_applies_every_room(hass: HomeAssistant) -> None:
+    """resync reads all rooms once and pushes each of them."""
+    levels = [
+        Level(room_id=1, current_scene_id=-1, channel_levels=[make_channel_level(0, 11)]),
+        Level(room_id=2, current_scene_id=1, channel_levels=[make_channel_level(0, 0)]),
+    ]
+    client = _make_refresh_client(hass, levels)
+    light_1 = MagicMock()
+    light_2 = MagicMock()
+    client._light_map = {f"{MOCK_HUB_ID}_1_0": light_1, f"{MOCK_HUB_ID}_2_0": light_2}
+
+    await client.resync()
+
+    client.get_levels.assert_awaited_once_with()
+    assert light_1.brightness == 11
+    light_2.assume_on.assert_called_once_with()
+
+
+async def test_resync_handles_get_levels_failure(hass: HomeAssistant) -> None:
+    """A hub that cannot be read leaves the entities alone."""
+    client = _make_refresh_client(hass, [])
+    client.get_levels = AsyncMock(side_effect=ConnectionResetError("hub unreachable"))
+    light = MagicMock()
+    light.brightness = 42
+    client._light_map = {f"{MOCK_HUB_ID}_1_0": light}
+
+    await client.resync()
+
+    assert light.brightness == 42
+
+
+async def test_subscribe_resync_requested_resyncs(hass: HomeAssistant) -> None:
+    """A ResyncRequested marker from the event stream re-reads the hub."""
+    client = MagicMock()
+    client.resync = AsyncMock()
+
+    await _run_subscribe_with_events(client, [ResyncRequested()])
+
+    client.resync.assert_awaited_once_with()
+
+
+# ---------------------------------------------------------------------------
+# get_events
+# ---------------------------------------------------------------------------
+
+class _FakeReader:
+    """StreamReader stand-in fed from a list of lines; None blocks forever, b"" is EOF."""
+
+    def __init__(self, lines):
+        self._lines = list(lines)
+
+    async def readline(self):
+        if not self._lines:
+            await asyncio.sleep(3600)
+        line = self._lines.pop(0)
+        if line is None:
+            await asyncio.sleep(3600)
+        return line
+
+
+def _fake_connection(reader):
+    writer = MagicMock()
+    writer.drain = AsyncMock()
+    writer.get_extra_info = MagicMock(return_value=None)
+
+    async def open_connection(*args, **kwargs):
+        return reader, writer
+
+    return open_connection, writer
+
+
+async def _collect_events(client, count):
+    events = []
+    async for event in client.get_events():
+        events.append(event)
+        if len(events) == count:
+            break
+    return events
+
+
+async def test_get_events_parses_tracker_lines(hass: HomeAssistant) -> None:
+    """The stream yields a resync first, then the hub's scene and level events."""
+    client = _make_live_client(hass)
+    client.client_name = "test"
+    client.host = MOCK_HOST
+    client.port = 9762
+    reader = _FakeReader([
+        b'{"name":"connected","payload":{}}\r\n',
+        b'{"name":"tracker","type":"scene","payload":{"roomId":10,"channelId":0,"scene":1,"activeScene":1}}\r\n',
+        b'not json\r\n',
+        b'{"name":"tracker","type":"level","payload":{"roomId":10,"channelId":1,"currentLevel":200,"targetLevel":0,"timeToTake":1248,"temporary":false}}\r\n',
+    ])
+    open_connection, writer = _fake_connection(reader)
+
+    with patch("custom_components.rako.hub_client.asyncio.open_connection", open_connection):
+        events = await _collect_events(client, 3)
+
+    assert isinstance(events[0], ResyncRequested)
+    assert events[1] == SceneChangedEvent(room_id=10, channel_id=0, scene_id=1, active_scene_id=1)
+    assert events[2] == LevelChangedEvent(
+        room_id=10, channel_id=1, current_level=200, target_level=0, time_to_take=1248, temporary=False
+    )
+    assert writer.write.call_args[0][0].startswith(b"SUB,JSON,")
+    assert b'"TRACKER"' in writer.write.call_args[0][0]
+
+
+async def test_get_events_reconnects_after_eof(hass: HomeAssistant) -> None:
+    """A closed stream is reopened, after a delay, and asks for a resync again."""
+    client = _make_live_client(hass)
+    client.client_name = "test"
+    client.host = MOCK_HOST
+    client.port = 9762
+    readers = [_FakeReader([b""]), _FakeReader([None])]
+    writers = []
+
+    async def open_connection(*args, **kwargs):
+        reader = readers.pop(0)
+        _, writer = _fake_connection(reader)
+        writers.append(writer)
+        return reader, writer
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    with patch("custom_components.rako.hub_client.asyncio.open_connection", open_connection), \
+         patch("custom_components.rako.hub_client.asyncio.sleep", fake_sleep):
+        events = await _collect_events(client, 2)
+
+    assert all(isinstance(event, ResyncRequested) for event in events)
+    assert len(writers) == 2
+    writers[0].close.assert_called_once()
+    assert sleeps == [EVENT_RECONNECT_DELAY]
+
+
+async def test_get_events_resyncs_when_quiet(hass: HomeAssistant) -> None:
+    """A stream with nothing to say for the resync interval asks for a resync."""
+    client = _make_live_client(hass)
+    client.client_name = "test"
+    client.host = MOCK_HOST
+    client.port = 9762
+    open_connection, _ = _fake_connection(_FakeReader([None]))
+
+    with patch("custom_components.rako.hub_client.asyncio.open_connection", open_connection), \
+         patch("custom_components.rako.hub_client.EVENT_RESYNC_INTERVAL", 0.01):
+        events = await _collect_events(client, 2)
+
+    assert all(isinstance(event, ResyncRequested) for event in events)
+
+
+async def test_get_events_retries_failed_connect(hass: HomeAssistant) -> None:
+    """A refused connection is retried with a growing delay."""
+    client = _make_live_client(hass)
+    client.client_name = "test"
+    client.host = MOCK_HOST
+    client.port = 9762
+    attempts = []
+
+    async def open_connection(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise ConnectionRefusedError("refused")
+        reader = _FakeReader([None])
+        return reader, _fake_connection(reader)[1]
+
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    with patch("custom_components.rako.hub_client.asyncio.open_connection", open_connection), \
+         patch("custom_components.rako.hub_client.asyncio.sleep", fake_sleep):
+        events = await _collect_events(client, 1)
+
+    assert isinstance(events[0], ResyncRequested)
+    assert sleeps == [EVENT_RECONNECT_DELAY, EVENT_RECONNECT_DELAY * 2]
+
+
+def test_enable_keepalive_sets_socket_options() -> None:
+    """Keepalive is switched on with the probe timings."""
+    sock = MagicMock()
+    writer = MagicMock()
+    writer.get_extra_info = MagicMock(return_value=sock)
+
+    _enable_keepalive(writer)
+
+    calls = sock.setsockopt.call_args_list
+    assert calls[0][0] == (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    assert len(calls) >= 1

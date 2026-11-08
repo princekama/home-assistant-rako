@@ -15,7 +15,7 @@ from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from rakopy.errors import SendCommandError
 from rakopy.model import Channel, ChannelLevel, Room
-from .hub_client import HubClient, effective_level
+from .hub_client import ASSUMED_ON_LEVEL, HubClient, effective_level
 from .model import RakoDomainEntryData
 
 _LOGGER = logging.getLogger(__name__)
@@ -31,9 +31,11 @@ async def async_setup_entry(
     hub_client = rako_domain_entry_data["hub_client"]
 
     levels_lookup = {}
+    scene_lookup = {}
     levels = await hub_client.get_levels()
     for level in levels:
         levels_lookup[level.room_id] = {}
+        scene_lookup[level.room_id] = level.current_scene_id
         for channel_level in level.channel_levels:
             levels_lookup[level.room_id][channel_level.channel_id] = channel_level
 
@@ -51,7 +53,8 @@ async def async_setup_entry(
                             hub_client=hub_client,
                             room=room,
                             channel=None,
-                            channel_level=channel_level
+                            channel_level=channel_level,
+                            room_scene_id=scene_lookup[room.id],
                         )
                     )
                 else:
@@ -65,7 +68,8 @@ async def async_setup_entry(
                                 hub_client=hub_client,
                                 room=room,
                                 channel=channel,
-                                channel_level=channel_level
+                                channel_level=channel_level,
+                                room_scene_id=scene_lookup[room.id],
                             )
                         )
                     else:
@@ -83,13 +87,19 @@ class RakoLightEntity(LightEntity):
             hub_client: HubClient,
             room: Room,
             channel: Channel,
-            channel_level: ChannelLevel
+            channel_level: ChannelLevel,
+            room_scene_id: int | None = None,
         ) -> None:
         """Initialize a RakoLightEntity."""
         self._hub_client = hub_client
         self._room = room
         self._channel = channel
         self._brightness = effective_level(channel_level)
+        self._last_on_brightness = self._brightness or ASSUMED_ON_LEVEL
+        # A room in a scene is on even when the hub reports its channels at 0
+        # (a hub without scene levels in its project); see HubClient.assume_on
+        if room_scene_id is not None and room_scene_id > 0 and self._brightness == 0:
+            self._brightness = ASSUMED_ON_LEVEL
         # Only support brightness for now; channels with a color_type (e.g. RGB)
         # are treated as brightness-only until full colour support is implemented.
         self.supported_color_modes = {ColorMode.BRIGHTNESS}
@@ -104,9 +114,20 @@ class RakoLightEntity(LightEntity):
     def brightness(self, value: int) -> None:
         """Set the brightness. Used when state is updated outside Home Assistant."""
         self._brightness = value
+        if value > 0:
+            self._last_on_brightness = value
         # Not yet added to hass: HA reads the stored value when it is added
         if self.hass is not None:
             self.async_write_ha_state()
+
+    def assume_on(self) -> None:
+        """Show the light on when the hub only reports that its room is in a scene.
+
+        The brightness is the last one this light was seen at, since the hub
+        does not know the scene's levels.
+        """
+        if self._brightness == 0:
+            self.brightness = self._last_on_brightness
 
     @property
     def is_on(self) -> bool:
