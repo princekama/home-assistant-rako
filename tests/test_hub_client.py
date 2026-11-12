@@ -252,8 +252,8 @@ async def test_subscribe_level_changed_updates_cover(hass: HomeAssistant) -> Non
     assert cover.current_cover_position == 255
 
 
-async def test_subscribe_scene_changed_updates_scene(hass: HomeAssistant) -> None:
-    """SceneChangedEvent should update the matching scene select entity."""
+async def test_subscribe_scene_changed_applies_scene(hass: HomeAssistant) -> None:
+    """SceneChangedEvent should be applied locally via apply_scene."""
     client = MagicMock()
     client.hub_id = MOCK_HUB_ID
 
@@ -270,11 +270,11 @@ async def test_subscribe_scene_changed_updates_scene(hass: HomeAssistant) -> Non
     )
     await _run_subscribe_with_events(client, [event])
 
-    assert scene.current_option == 2
+    client.apply_scene.assert_called_once_with(1, 0, 2)
 
 
-async def test_subscribe_scene_off_turns_off_room(hass: HomeAssistant) -> None:
-    """SceneChangedEvent for scene 0 should switch the room off via set_room_off."""
+async def test_subscribe_scene_off_passes_channel(hass: HomeAssistant) -> None:
+    """SceneChangedEvent for scene 0 should pass its channel so only that scope goes off."""
     client = MagicMock()
     client.hub_id = MOCK_HUB_ID
     client.refresh_room = AsyncMock()
@@ -283,11 +283,11 @@ async def test_subscribe_scene_off_turns_off_room(hass: HomeAssistant) -> None:
     client._cover_map = {}
 
     event = SceneChangedEvent(
-        room_id=1, channel_id=0, scene_id=0, active_scene_id=0
+        room_id=1, channel_id=2, scene_id=0, active_scene_id=0
     )
     await _run_subscribe_with_events(client, [event])
 
-    client.set_room_off.assert_called_once_with(1)
+    client.apply_scene.assert_called_once_with(1, 2, 0)
     # Scene 0 is handled locally; re-reading levels could return stale values
     client.refresh_room.assert_not_awaited()
 
@@ -452,8 +452,8 @@ async def test_refresh_room_only_touches_requested_room(hass: HomeAssistant) -> 
     assert room_2_light.brightness == 7
 
 
-async def test_refresh_room_skips_unregistered_and_unadded_lights(hass: HomeAssistant) -> None:
-    """Channels with no registered light, or a light not yet added to hass, are skipped."""
+async def test_refresh_room_updates_unadded_lights(hass: HomeAssistant) -> None:
+    """Channels with no registered light are skipped; a light not yet added still gets the level."""
     levels = [
         Level(
             room_id=1,
@@ -467,10 +467,11 @@ async def test_refresh_room_skips_unregistered_and_unadded_lights(hass: HomeAssi
     not_added.brightness = 3
     client._light_map = {f"{MOCK_HUB_ID}_1_0": not_added}
 
-    # Channel 1 has no registered light; channel 0's light has no hass. Should not raise.
+    # Channel 1 has no registered light. Should not raise.
     await client.refresh_room(1)
 
-    assert not_added.brightness == 3
+    # The entity's setter skips the HA write itself when hass is None
+    assert not_added.brightness == 200
 
 
 async def test_refresh_room_handles_get_levels_failure(hass: HomeAssistant) -> None:
@@ -560,53 +561,94 @@ async def test_send_delegates_to_rakopy(hass: HomeAssistant) -> None:
 
 
 # ---------------------------------------------------------------------------
-# set_room_off
+# apply_scene
 # ---------------------------------------------------------------------------
 
-def test_set_room_off_updates_select_and_lights(hass: HomeAssistant) -> None:
-    """set_room_off should reset the room's scene select and zero its lights only."""
+def _make_apply_client(hass: HomeAssistant) -> HubClient:
+    """HubClient with one select, light and cover in room 1 and in room 2."""
     client = _make_hub_client(hass)
     mock_entry = MagicMock()
     mock_entry.runtime_data = {"hub_id": MOCK_HUB_ID}
     hass.config_entries.async_get_entry = MagicMock(return_value=mock_entry)
-    scene = MagicMock()
-    other_scene = MagicMock()
-    room_light = MagicMock()
-    channel_light = MagicMock()
-    other_room_light = MagicMock()
-    client._scene_map = {f"{MOCK_HUB_ID}_1": scene, f"{MOCK_HUB_ID}_2": other_scene}
-    client._light_map = {
-        f"{MOCK_HUB_ID}_1_0": room_light,
-        f"{MOCK_HUB_ID}_1_1": channel_light,
-        f"{MOCK_HUB_ID}_2_0": other_room_light,
-    }
-    other_room_light.brightness = 99
-    other_scene.current_option = 1
-    room_cover = MagicMock()
-    other_room_cover = MagicMock()
-    other_room_cover.current_cover_position = 100
-    client._cover_map = {
-        f"{MOCK_HUB_ID}_1_1": room_cover,
-        f"{MOCK_HUB_ID}_2_1": other_room_cover,
-    }
-    unadded_cover = MagicMock()
-    unadded_cover.hass = None
-    unadded_cover.current_cover_position = 55
-    client._cover_map[f"{MOCK_HUB_ID}_1_9"] = unadded_cover
-    # An entity that isn't added to hass yet must be left alone
+    client._scene_map = {}
+    client._light_map = {}
+    client._cover_map = {}
+    for room in (1, 2):
+        scene = MagicMock()
+        scene.current_option = 1
+        client._scene_map[f"{MOCK_HUB_ID}_{room}"] = scene
+        for channel in (0, 1, 2):
+            light = MagicMock()
+            light.brightness = 99
+            client._light_map[f"{MOCK_HUB_ID}_{room}_{channel}"] = light
+        cover = MagicMock()
+        cover.current_cover_position = 100
+        client._cover_map[f"{MOCK_HUB_ID}_{room}_3"] = cover
+    return client
+
+
+def test_apply_scene_room_off(hass: HomeAssistant) -> None:
+    """Scene 0 on channel 0 turns off the room's select, lights and covers only."""
+    client = _make_apply_client(hass)
+    # An entity not yet added to hass still gets the value (its setter skips the write)
     unadded_light = MagicMock()
     unadded_light.hass = None
     unadded_light.brightness = 77
     client._light_map[f"{MOCK_HUB_ID}_1_9"] = unadded_light
 
-    client.set_room_off(1)
+    client.apply_scene(1, 0, 0)
 
-    assert scene.current_option == 0
-    assert room_light.brightness == 0
-    assert channel_light.brightness == 0
-    assert other_room_light.brightness == 99
-    assert other_scene.current_option == 1
-    assert unadded_light.brightness == 77
-    assert room_cover.current_cover_position == 0
-    assert other_room_cover.current_cover_position == 100
-    assert unadded_cover.current_cover_position == 55
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 0
+    for channel in (0, 1, 2, 9):
+        assert client._light_map[f"{MOCK_HUB_ID}_1_{channel}"].brightness == 0
+    assert client._cover_map[f"{MOCK_HUB_ID}_1_3"].current_cover_position == 0
+    assert client._scene_map[f"{MOCK_HUB_ID}_2"].current_option == 1
+    for channel in (0, 1, 2):
+        assert client._light_map[f"{MOCK_HUB_ID}_2_{channel}"].brightness == 99
+    assert client._cover_map[f"{MOCK_HUB_ID}_2_3"].current_cover_position == 100
+
+
+def test_apply_scene_channel_off_only_affects_that_channel(hass: HomeAssistant) -> None:
+    """Scene 0 on a single channel leaves the room's select and other channels alone."""
+    client = _make_apply_client(hass)
+
+    client.apply_scene(1, 2, 0)
+
+    assert client._light_map[f"{MOCK_HUB_ID}_1_2"].brightness == 0
+    assert client._light_map[f"{MOCK_HUB_ID}_1_0"].brightness == 99
+    assert client._light_map[f"{MOCK_HUB_ID}_1_1"].brightness == 99
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 1
+    assert client._cover_map[f"{MOCK_HUB_ID}_1_3"].current_cover_position == 100
+
+
+def test_apply_scene_channel_off_closes_that_cover(hass: HomeAssistant) -> None:
+    """Scene 0 on a blind's channel closes just that blind."""
+    client = _make_apply_client(hass)
+
+    client.apply_scene(1, 3, 0)
+
+    assert client._cover_map[f"{MOCK_HUB_ID}_1_3"].current_cover_position == 0
+    assert client._light_map[f"{MOCK_HUB_ID}_1_0"].brightness == 99
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 1
+
+
+def test_apply_scene_non_zero_updates_select_only(hass: HomeAssistant) -> None:
+    """A non-zero scene updates the room's select and leaves levels to refresh_room."""
+    client = _make_apply_client(hass)
+
+    client.apply_scene(1, 0, 3)
+
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 3
+    assert client._light_map[f"{MOCK_HUB_ID}_1_0"].brightness == 99
+    assert client._cover_map[f"{MOCK_HUB_ID}_1_3"].current_cover_position == 100
+    assert client._scene_map[f"{MOCK_HUB_ID}_2"].current_option == 1
+
+
+def test_apply_scene_without_config_entry_does_nothing(hass: HomeAssistant) -> None:
+    """During unload the config entry can be gone; apply_scene must not raise."""
+    client = _make_apply_client(hass)
+    hass.config_entries.async_get_entry = MagicMock(return_value=None)
+
+    client.apply_scene(1, 0, 0)
+
+    assert client._light_map[f"{MOCK_HUB_ID}_1_0"].brightness == 99

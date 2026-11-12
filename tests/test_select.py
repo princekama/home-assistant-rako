@@ -152,7 +152,7 @@ async def test_select_option_off(mock_hub_client, monkeypatch) -> None:
     mock_hub_client.set_scene.assert_awaited_once_with(1, 0, 0)
 
 
-async def test_select_option_off_uses_set_room_off(mock_hub_client, monkeypatch) -> None:
+async def test_select_option_off_applies_scene_locally(mock_hub_client, monkeypatch) -> None:
     """Selecting 'Off' should switch the room off locally, without a hub query."""
     entity = _make_scene_entity(mock_hub_client, current_scene_id=1)
     monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
@@ -160,13 +160,14 @@ async def test_select_option_off_uses_set_room_off(mock_hub_client, monkeypatch)
     await entity.async_select_option("Off")
 
     mock_hub_client.set_scene.assert_awaited_once_with(1, 0, 0)
-    mock_hub_client.set_room_off.assert_called_once_with(1)
+    mock_hub_client.apply_scene.assert_called_once_with(1, 0, 0)
     mock_hub_client.refresh_room.assert_not_awaited()
 
 
 async def test_select_option_updates_state(mock_hub_client, monkeypatch) -> None:
     """After selecting a scene the entity should report it and write HA state."""
     entity = _make_scene_entity(mock_hub_client, current_scene_id=0)
+    entity.hass = MagicMock()
     written: list[bool] = []
     monkeypatch.setattr(entity, "async_write_ha_state", lambda: written.append(True))
 
@@ -257,3 +258,13 @@ async def test_select_option_off_closes_covers_in_blind_room(hass: HomeAssistant
     client.set_scene.assert_awaited_once_with(1, 0, 0)
     assert cover.current_cover_position == 0
     assert other_cover.current_cover_position == 255
+
+
+def test_current_option_setter_before_added_to_hass(mock_hub_client) -> None:
+    """Before the select is added to hass the setter stores the value without writing state."""
+    entity = _make_scene_entity(mock_hub_client, current_scene_id=1)
+    assert entity.hass is None
+
+    entity.current_option = 0
+
+    assert entity._current_scene_id == 0

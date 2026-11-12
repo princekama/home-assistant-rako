@@ -78,7 +78,9 @@ class RakoSceneEntity(SelectEntity):
         for scene in self._room.scenes:
             if scene.id == value:
                 self._attr_current_option = scene.title
-                self.async_write_ha_state()
+                # Not yet added to hass: HA reads the stored value when it is added
+                if self.hass is not None:
+                    self.async_write_ha_state()
 
     @property
     def name(self) -> str:
@@ -116,9 +118,9 @@ class RakoSceneEntity(SelectEntity):
         scene_id = self._reverse_lookup[option]
         await self._hub_client.set_scene(self._room.id, 0, scene_id)
         if scene_id == 0:
-            # Off is handled without a hub query: update this select and zero
-            # the room's lights directly
-            self._hub_client.set_room_off(self._room.id)
+            # Off is applied locally without a hub query: this select goes to
+            # Off and the room's lights and covers go to 0 (closed)
+            self._hub_client.apply_scene(self._room.id, 0, 0)
             return
         # The hub does not reliably push events back after a scene command, so
         # update our own state and then re-read the room's channel levels so the
