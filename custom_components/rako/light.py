@@ -104,7 +104,9 @@ class RakoLightEntity(LightEntity):
     def brightness(self, value: int) -> None:
         """Set the brightness. Used when state is updated outside Home Assistant."""
         self._brightness = value
-        self.async_write_ha_state()
+        # Not yet added to hass: HA reads the stored value when it is added
+        if self.hass is not None:
+            self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool:
@@ -144,6 +146,9 @@ class RakoLightEntity(LightEntity):
             try:
                 await self._hub_client.set_scene(self._room.id, 0, 0)
                 self.brightness = 0
+                # Scene 0 turns the whole room off, so also update the room's
+                # scene select, channel lights and covers
+                self._hub_client.apply_scene(self._room.id, 0, 0)
 
             except (SendCommandError):
                 _LOGGER.error("An error occurred while updating the Rako Light")

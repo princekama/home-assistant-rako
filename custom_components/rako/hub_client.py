@@ -111,6 +111,55 @@ class HubClient(Hub):
         self._reader = None
         self._writer = None
 
+    def apply_scene(self, room_id: int, channel_id: int, scene_id: int) -> None:
+        """Reflect a scene change locally on the affected select, lights and covers.
+
+        Used for commands sent from HA and for scene events from the hub,
+        because the hub doesn't push level events for scene 0 or for commands
+        sent from HA. No hub query is made, so this can't block commands.
+
+        - Scene 0 on channel 0 turns the whole room off: the room's select goes
+          to Off, and every light and cover in the room goes to 0 (closed).
+        - Scene 0 on another channel turns off only that channel's light or cover.
+        - Any other scene on channel 0 updates the room's select only. Callers
+          that need channel levels should follow up with refresh_room.
+        - Any other scene on another channel (e.g. a blind's open or stop) is
+          ignored: it isn't a room scene, so the select must not change.
+        """
+        entry = self.hass.config_entries.async_get_entry(self.entry_id)
+        if entry is None:
+            # The entry is being unloaded; there are no entities to update
+            return
+        hub_id = entry.runtime_data["hub_id"]
+
+        if scene_id != 0:
+            if channel_id != 0:
+                return
+            scene = self._scene_map.get(f"{hub_id}_{room_id}")
+            if scene is not None:
+                scene.current_option = scene_id
+            return
+
+        if channel_id != 0:
+            unique_id = f"{hub_id}_{room_id}_{channel_id}"
+            if (light := self._light_map.get(unique_id)) is not None:
+                light.brightness = 0
+            if (cover := self._cover_map.get(unique_id)) is not None:
+                cover.current_cover_position = 0
+            return
+
+        scene = self._scene_map.get(f"{hub_id}_{room_id}")
+        if scene is not None:
+            scene.current_option = 0
+        prefix = f"{hub_id}_{room_id}_"
+        for unique_id, light in self._light_map.items():
+            if unique_id.startswith(prefix):
+                light.brightness = 0
+        # Room-wide scene 0 closes blinds and curtains
+        for unique_id, cover in self._cover_map.items():
+            if unique_id.startswith(prefix):
+                cover.current_cover_position = 0
+
     async def refresh_room(self, room_id: int) -> None:
         """Re-read a room's channel levels from the hub and push them to its lights and covers."""
         try:
@@ -131,11 +180,9 @@ class HubClient(Hub):
                 continue
             for channel_level in level.channel_levels:
                 unique_id = f"{hub_id}_{room_id}_{channel_level.channel_id}"
-                light = self._light_map.get(unique_id)
-                if light is not None and getattr(light, "hass", None) is not None:
+                if (light := self._light_map.get(unique_id)) is not None:
                     light.brightness = effective_level(channel_level)
-                cover = self._cover_map.get(unique_id)
-                if cover is not None and getattr(cover, "hass", None) is not None:
+                if (cover := self._cover_map.get(unique_id)) is not None:
                     cover.current_cover_position = effective_level(channel_level)
             break
 
@@ -173,17 +220,11 @@ async def subscribe_to_events(hub_client: HubClient) -> None:
                     hub_client._light_map[unique_id].brightness = effective_level(event)
 
             elif event and isinstance(event, SceneChangedEvent):
-                unique_id = f"{hub_client.hub_id}_{event.room_id}"
-                if unique_id in hub_client._scene_map:
-                    hub_client._scene_map[unique_id].current_option = event.active_scene_id
-
-                # Scene 0 is "off" (e.g. from a keypad), and the hub does not
-                # push level events for it, so turn off the room's lights here
-                if event.active_scene_id == 0:
-                    light_prefix = f"{unique_id}_"
-                    for light_unique_id, light in hub_client._light_map.items():
-                        if light_unique_id.startswith(light_prefix):
-                            light.brightness = 0
+                # The hub doesn't push level events for scene 0 (e.g. Off from
+                # a keypad), so apply the scene to the affected entities here
+                hub_client.apply_scene(
+                    event.room_id, event.channel_id, event.active_scene_id
+                )
 
         except Exception as e:
             _LOGGER.exception("Unexpected exception: %s", repr(e))

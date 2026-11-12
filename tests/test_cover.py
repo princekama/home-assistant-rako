@@ -370,3 +370,14 @@ async def test_async_will_remove_from_hass(mock_hub_client) -> None:
     cover = _make_cover(mock_hub_client)
     await cover.async_will_remove_from_hass()
     mock_hub_client.remove_cover.assert_awaited_once_with(cover)
+
+
+def test_position_setter_before_added_to_hass(mock_hub_client) -> None:
+    """Before the cover is added to hass the setter stores the value without writing state."""
+    cover = _make_cover(mock_hub_client, current_level=255)
+    assert cover.hass is None
+
+    cover.current_cover_position = 0
+
+    assert cover.current_cover_position == 0
+    assert cover.is_closed is True

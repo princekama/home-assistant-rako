@@ -214,6 +214,8 @@ async def test_turn_off_room_level(mock_hub_client) -> None:
     mock_hub_client.set_scene.assert_awaited_once_with(3, 0, 0)
     assert light._brightness == 0
     assert light.is_on is False
+    # The rest of the room (select, channel lights, covers) is updated by apply_scene
+    mock_hub_client.apply_scene.assert_called_once_with(3, 0, 0)
 
 
 async def test_turn_off_room_level_send_command_error(mock_hub_client) -> None:
@@ -269,3 +271,14 @@ async def test_async_will_remove_from_hass(mock_hub_client) -> None:
     light = _make_light(mock_hub_client)
     await light.async_will_remove_from_hass()
     mock_hub_client.remove_light.assert_awaited_once_with(light)
+
+
+def test_brightness_setter_before_added_to_hass(mock_hub_client) -> None:
+    """Before the light is added to hass the setter stores the value without writing state."""
+    light = _make_light(mock_hub_client, brightness=200)
+    assert light.hass is None
+
+    light.brightness = 0
+
+    assert light.brightness == 0
+    assert light.is_on is False

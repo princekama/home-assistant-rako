@@ -133,7 +133,9 @@ class RakoCoverEntity(CoverEntity):
     def current_cover_position(self, value: int) -> None:
         """Set the current position. Used when state is updated outside Home Assistant."""
         self._current_position = self._rako_to_ha_position(value)
-        self.async_write_ha_state()
+        # Not yet added to hass: HA reads the stored value when it is added
+        if self.hass is not None:
+            self.async_write_ha_state()
 
     @property
     def is_closed(self) -> bool:
