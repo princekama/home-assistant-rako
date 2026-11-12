@@ -121,8 +121,10 @@ class HubClient(Hub):
         - Scene 0 on channel 0 turns the whole room off: the room's select goes
           to Off, and every light and cover in the room goes to 0 (closed).
         - Scene 0 on another channel turns off only that channel's light or cover.
-        - Any other scene updates the room's select only. Callers that need
-          channel levels should follow up with refresh_room.
+        - Any other scene on channel 0 updates the room's select only. Callers
+          that need channel levels should follow up with refresh_room.
+        - Any other scene on another channel (e.g. a blind's open or stop) is
+          ignored: it isn't a room scene, so the select must not change.
         """
         entry = self.hass.config_entries.async_get_entry(self.entry_id)
         if entry is None:
@@ -131,6 +133,8 @@ class HubClient(Hub):
         hub_id = entry.runtime_data["hub_id"]
 
         if scene_id != 0:
+            if channel_id != 0:
+                return
             scene = self._scene_map.get(f"{hub_id}_{room_id}")
             if scene is not None:
                 scene.current_option = scene_id

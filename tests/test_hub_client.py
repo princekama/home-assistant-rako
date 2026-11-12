@@ -644,6 +644,20 @@ def test_apply_scene_non_zero_updates_select_only(hass: HomeAssistant) -> None:
     assert client._scene_map[f"{MOCK_HUB_ID}_2"].current_option == 1
 
 
+@pytest.mark.parametrize("scene_id", [1, 3])
+def test_apply_scene_non_zero_on_channel_leaves_room_alone(
+    hass: HomeAssistant, scene_id: int
+) -> None:
+    """A blind's open (1) or stop (3) on its channel must not change the room's select."""
+    client = _make_apply_client(hass)
+
+    client.apply_scene(1, 3, scene_id)
+
+    assert client._scene_map[f"{MOCK_HUB_ID}_1"].current_option == 1
+    assert client._cover_map[f"{MOCK_HUB_ID}_1_3"].current_cover_position == 100
+    assert client._light_map[f"{MOCK_HUB_ID}_1_0"].brightness == 99
+
+
 def test_apply_scene_without_config_entry_does_nothing(hass: HomeAssistant) -> None:
     """During unload the config entry can be gone; apply_scene must not raise."""
     client = _make_apply_client(hass)
