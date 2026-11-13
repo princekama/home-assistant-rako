@@ -33,6 +33,7 @@ async def async_setup_entry(
     levels_lookup = {}
     scene_lookup = {}
     levels = await hub_client.get_levels()
+    hub_client.learn_levels(levels)
     for level in levels:
         levels_lookup[level.room_id] = {}
         scene_lookup[level.room_id] = level.current_scene_id
@@ -96,9 +97,14 @@ class RakoLightEntity(LightEntity):
         self._channel = channel
         self._brightness = effective_level(channel_level)
         self._last_on_brightness = self._brightness or ASSUMED_ON_LEVEL
-        # A room in a scene is on even when the hub reports its channels at 0
-        # (a hub without scene levels in its project); see HubClient.assume_on
-        if room_scene_id is not None and room_scene_id > 0 and self._brightness == 0:
+        # A room in a scene is on even when a hub without scene levels in its
+        # project reports its channels at 0; see HubClient.room_levels_reported
+        if (
+            room_scene_id is not None
+            and room_scene_id > 0
+            and self._brightness == 0
+            and not hub_client.room_levels_reported(room.id)
+        ):
             self._brightness = ASSUMED_ON_LEVEL
         # Only support brightness for now; channels with a color_type (e.g. RGB)
         # are treated as brightness-only until full colour support is implemented.
