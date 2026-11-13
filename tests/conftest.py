@@ -209,6 +209,8 @@ def mock_hub_client(
     client.add_scene = AsyncMock()
     client.remove_scene = AsyncMock()
     client.refresh_room = AsyncMock()
+    client.learn_levels = MagicMock()
+    client.room_levels_reported = MagicMock(return_value=True)
     client.get_events = MagicMock()
 
     return client

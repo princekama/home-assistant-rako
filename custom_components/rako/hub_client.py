@@ -2,14 +2,17 @@
 from asyncio import Task
 import asyncio
 import contextlib
+from dataclasses import dataclass
+import json
 import logging
+import socket
 
 from homeassistant.components.cover import CoverEntity
 from homeassistant.components.light import LightEntity
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
 from rakopy.hub import Hub
-from rakopy.model import LevelChangedEvent, SceneChangedEvent
+from rakopy.model import Level, LevelChangedEvent, SceneChangedEvent
 from .model import RakoDomainEntryData
 
 _LOGGER = logging.getLogger(__name__)
@@ -18,12 +21,98 @@ _LOGGER = logging.getLogger(__name__)
 # query the hub never answers would block every later command
 REFRESH_TIMEOUT = 5
 
+EVENT_CONNECT_TIMEOUT = 10
+# Re-read every room from the hub when the event stream has been quiet this long
+EVENT_RESYNC_INTERVAL = 300
+EVENT_RECONNECT_DELAY = 5
+EVENT_RECONNECT_DELAY_MAX = 60
+# A NAT or stateful firewall between Home Assistant and the hub forgets an idle
+# connection; the hub's events then stop arriving with no error on our side.
+# Keepalive probes keep the mapping alive and surface a dead connection as an
+# error within a few minutes.
+KEEPALIVE_IDLE = 60
+KEEPALIVE_INTERVAL = 10
+KEEPALIVE_COUNT = 3
+# A room in a scene is on, but a hub without scene levels in its project
+# reports every channel at 0, so such a room's lights are shown at this level
+ASSUMED_ON_LEVEL = 255
+
+
+@dataclass
+class ResyncRequested:
+    """Yielded by get_events when the entities should be re-read from the hub."""
+
 
 def effective_level(level) -> int:
     """Return a channel's target level if it has one, otherwise its current level."""
     if level.target_level is not None:
         return level.target_level
     return level.current_level
+
+
+def scene_levels_reported(level: Level) -> bool | None:
+    """Whether the hub reports channel levels for a room that is in a scene.
+
+    A hub whose project holds no scene levels reports every channel of such a
+    room at 0. None when the room is off or at explicit levels (scene 0 or -1),
+    which says nothing either way.
+    """
+    if level.current_scene_id <= 0:
+        return None
+    return any(effective_level(channel_level) > 0 for channel_level in level.channel_levels)
+
+
+def _enable_keepalive(writer: asyncio.StreamWriter) -> None:
+    """Turn on TCP keepalive probes for a stream's socket."""
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (
+            ("TCP_KEEPIDLE", KEEPALIVE_IDLE),
+            ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL),
+            ("TCP_KEEPCNT", KEEPALIVE_COUNT),
+        ):
+            if hasattr(socket, name):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+    except OSError as e:
+        _LOGGER.debug("Could not enable keepalive on the hub event stream: %s", repr(e))
+
+
+def _parse_event(line: bytes):
+    """Turn one line of the hub's tracker stream into an event, or None."""
+    try:
+        json_data = json.loads(line)
+    except ValueError:
+        _LOGGER.debug("Ignoring unparseable line from the hub: %r", line[:200])
+        return None
+    if not isinstance(json_data, dict) or json_data.get("name") != "tracker":
+        return None
+    payload = json_data.get("payload")
+    if not isinstance(payload, dict):
+        _LOGGER.debug("Ignoring tracker event without a payload: %r", line[:200])
+        return None
+    try:
+        if json_data.get("type") == "scene":
+            return SceneChangedEvent(
+                room_id=payload["roomId"],
+                channel_id=payload["channelId"],
+                scene_id=payload["scene"],
+                active_scene_id=payload["activeScene"],
+            )
+        if json_data.get("type") == "level":
+            return LevelChangedEvent(
+                room_id=payload["roomId"],
+                channel_id=payload["channelId"],
+                current_level=payload["currentLevel"],
+                target_level=payload["targetLevel"],
+                time_to_take=payload["timeToTake"],
+                temporary=payload["temporary"],
+            )
+    except (KeyError, TypeError) as e:
+        _LOGGER.debug("Ignoring malformed tracker event (%r): %r", e, line[:200])
+    return None
 
 
 class HubClient(Hub):
@@ -45,6 +134,15 @@ class HubClient(Hub):
         self._cover_map: dict[str, CoverEntity] = {}
         self._light_map: dict[str, LightEntity] = {}
         self._scene_map: dict[str, SelectEntity] = {}
+        # Each room's current scene as the hub reports it: 0 off, -1 custom
+        # levels, otherwise the scene number
+        self._room_scene: dict[int, int] = {}
+        # Whether the hub reports channel levels for a room's scenes, learned
+        # from its readings (learn_levels). A room not yet seen in a scene
+        # takes the hub-wide answer, and the hub's levels are trusted until
+        # some room has shown otherwise.
+        self._room_levels_reported: dict[int, bool] = {}
+        self._hub_levels_reported: bool | None = None
 
     @property
     def hub_id(self) -> str:
@@ -111,18 +209,46 @@ class HubClient(Hub):
         self._reader = None
         self._writer = None
 
-    def apply_scene(self, room_id: int, channel_id: int, scene_id: int) -> None:
+    def learn_levels(self, levels: list[Level]) -> None:
+        """Record, from a reading of the hub, which rooms it reports scene levels for."""
+        for level in levels:
+            reported = scene_levels_reported(level)
+            if reported is not None:
+                self._room_levels_reported[level.room_id] = reported
+                self._hub_levels_reported = reported
+
+    def room_levels_reported(self, room_id: int) -> bool:
+        """Whether the hub's channel levels for a room are to be believed while it is in a scene.
+
+        False only for a hub that has been seen reporting a room in a scene
+        with every channel at 0; its lights are then shown on at an assumed
+        level and its level-0 events are not taken as lights going off.
+        """
+        reported = self._room_levels_reported.get(room_id, self._hub_levels_reported)
+        return True if reported is None else reported
+
+    def apply_scene(
+        self, room_id: int, channel_id: int, scene_id: int, active_scene_id: int | None = None
+    ) -> None:
         """Reflect a scene change locally on the affected select, lights and covers.
 
         Used for commands sent from HA and for scene events from the hub,
         because the hub doesn't push level events for scene 0 or for commands
         sent from HA. No hub query is made, so this can't block commands.
 
+        scene_id is what the room or channel was set to (-1 for explicit
+        levels); active_scene_id is the scene the hub still reports the room
+        in, which is what the select shows. It defaults to scene_id.
+
         - Scene 0 on channel 0 turns the whole room off: the room's select goes
           to Off, and every light and cover in the room goes to 0 (closed).
         - Scene 0 on another channel turns off only that channel's light or cover.
-        - Any other scene on channel 0 updates the room's select only. Callers
-          that need channel levels should follow up with refresh_room.
+        - Scene -1 on channel 0 is explicit levels: the select stays on the
+          active scene and the level events that follow carry the state.
+        - Any other scene on channel 0 updates the room's select. When the hub
+          reports no levels for the room's scenes (room_levels_reported) its
+          lights are shown on (RakoLightEntity.assume_on); otherwise the level
+          events that follow, or a refresh_room, carry the lights' state.
         - Any other scene on another channel (e.g. a blind's open or stop) is
           ignored: it isn't a room scene, so the select must not change.
         """
@@ -131,16 +257,12 @@ class HubClient(Hub):
             # The entry is being unloaded; there are no entities to update
             return
         hub_id = entry.runtime_data["hub_id"]
-
-        if scene_id != 0:
-            if channel_id != 0:
-                return
-            scene = self._scene_map.get(f"{hub_id}_{room_id}")
-            if scene is not None:
-                scene.current_option = scene_id
-            return
+        if active_scene_id is None:
+            active_scene_id = scene_id
 
         if channel_id != 0:
+            if scene_id != 0:
+                return
             unique_id = f"{hub_id}_{room_id}_{channel_id}"
             if (light := self._light_map.get(unique_id)) is not None:
                 light.brightness = 0
@@ -148,43 +270,165 @@ class HubClient(Hub):
                 cover.current_cover_position = 0
             return
 
+        # A room scene: remember it so level events can be read in its light
+        self._room_scene[room_id] = scene_id
         scene = self._scene_map.get(f"{hub_id}_{room_id}")
         if scene is not None:
-            scene.current_option = 0
+            scene.current_option = active_scene_id
+        if scene_id == -1:
+            return
+
         prefix = f"{hub_id}_{room_id}_"
-        for unique_id, light in self._light_map.items():
-            if unique_id.startswith(prefix):
-                light.brightness = 0
-        # Room-wide scene 0 closes blinds and curtains
-        for unique_id, cover in self._cover_map.items():
-            if unique_id.startswith(prefix):
-                cover.current_cover_position = 0
+        if scene_id == 0:
+            for unique_id, light in self._light_map.items():
+                if unique_id.startswith(prefix):
+                    light.brightness = 0
+            # Room-wide scene 0 closes blinds and curtains
+            for unique_id, cover in self._cover_map.items():
+                if unique_id.startswith(prefix):
+                    cover.current_cover_position = 0
+        elif not self.room_levels_reported(room_id):
+            for unique_id, light in self._light_map.items():
+                if unique_id.startswith(prefix):
+                    light.assume_on()
+
+    async def get_events(self):
+        """Subscribe to the hub's tracker stream and yield events from it.
+
+        Replaces rakopy's generator: that one reads with no timeout, dies on a
+        closed stream (an empty line is not JSON) and only reconnects on a
+        ConnectionError. This one keeps the connection probed, reconnects with
+        a backoff on any failure, and yields ResyncRequested after each
+        (re)connect and whenever the stream has been quiet for a while, so the
+        entities are re-read from the hub.
+        """
+        delay = EVENT_RECONNECT_DELAY
+        while True:
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port, limit=1048576),
+                    EVENT_CONNECT_TIMEOUT,
+                )
+            except (OSError, asyncio.TimeoutError) as e:
+                _LOGGER.warning(
+                    "Could not connect to the hub event stream (%s), retrying in %s s",
+                    repr(e), delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, EVENT_RECONNECT_DELAY_MAX)
+                continue
+
+            _enable_keepalive(writer)
+            try:
+                payload = {
+                    "version": 2,
+                    "client_name": self.client_name,
+                    "subscriptions": ["TRACKER"],
+                }
+                writer.write(str.encode(f"SUB,JSON,{json.dumps(payload)}\r\n"))
+                await writer.drain()
+                _LOGGER.debug("Subscribed to the hub event stream")
+                delay = EVENT_RECONNECT_DELAY
+                yield ResyncRequested()
+
+                while True:
+                    try:
+                        line = await asyncio.wait_for(reader.readline(), EVENT_RESYNC_INTERVAL)
+                    except asyncio.TimeoutError:
+                        yield ResyncRequested()
+                        continue
+                    if not line:
+                        raise ConnectionResetError("the hub closed the event stream")
+                    event = _parse_event(line)
+                    if event is not None:
+                        yield event
+            # Anything but cancellation must reconnect: a dead listener is a
+            # dashboard that silently stops following the keypads
+            except Exception as e:
+                _LOGGER.warning(
+                    "Lost the hub event stream (%s), reconnecting in %s s",
+                    repr(e),
+                    delay,
+                    exc_info=not isinstance(e, (OSError, asyncio.TimeoutError)),
+                )
+            finally:
+                writer.close()
+
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, EVENT_RECONNECT_DELAY_MAX)
+
+    def _apply_room_level(self, level: Level) -> None:
+        """Push one room's scene and channel levels, as read from the hub, to its entities."""
+        hub_id = self.hub_id
+        room_id = level.room_id
+        scene_id = level.current_scene_id
+        self._room_scene[room_id] = scene_id
+
+        scene = self._scene_map.get(f"{hub_id}_{room_id}")
+        if scene is not None and scene_id >= 0:
+            scene.current_option = scene_id
+
+        # A hub without scene levels in its project reports 0 for every channel
+        # of a room that is in a scene; the room's lights are on, at an unknown level
+        self.learn_levels([level])
+        levels_known = scene_id <= 0 or self.room_levels_reported(room_id)
+        for channel_level in level.channel_levels:
+            unique_id = f"{hub_id}_{room_id}_{channel_level.channel_id}"
+            value = effective_level(channel_level)
+            if (light := self._light_map.get(unique_id)) is not None:
+                if levels_known:
+                    light.brightness = value
+                else:
+                    light.assume_on()
+            if (cover := self._cover_map.get(unique_id)) is not None:
+                cover.current_cover_position = value
+
+    async def _read_levels(self, what: str):
+        """Read every room's levels from the hub, or None when the hub did not answer."""
+        try:
+            return await asyncio.wait_for(self.get_levels(), REFRESH_TIMEOUT)
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Timed out reading levels for %s, reconnecting", what)
+            self._close_connection()
+        except (OSError, ValueError) as e:
+            _LOGGER.warning("Could not read levels for %s: %s", what, repr(e))
+        return None
 
     async def refresh_room(self, room_id: int) -> None:
         """Re-read a room's channel levels from the hub and push them to its lights and covers."""
-        try:
-            # Query all rooms rather than get_levels(room_id): the all-rooms
-            # query is the one the integration has always used at setup
-            levels = await asyncio.wait_for(self.get_levels(), REFRESH_TIMEOUT)
-        except TimeoutError:
-            _LOGGER.warning("Timed out refreshing levels for room %s, reconnecting", room_id)
-            self._close_connection()
+        # Query all rooms rather than get_levels(room_id): the all-rooms
+        # query is the one the integration has always used at setup
+        levels = await self._read_levels(f"room {room_id}")
+        if levels is None:
             return
-        except (OSError, ValueError) as e:
-            _LOGGER.warning("Could not refresh levels for room %s: %s", room_id, repr(e))
-            return
-
-        hub_id = self.hub_id
         for level in levels:
-            if level.room_id != room_id:
-                continue
-            for channel_level in level.channel_levels:
-                unique_id = f"{hub_id}_{room_id}_{channel_level.channel_id}"
-                if (light := self._light_map.get(unique_id)) is not None:
-                    light.brightness = effective_level(channel_level)
-                if (cover := self._cover_map.get(unique_id)) is not None:
-                    cover.current_cover_position = effective_level(channel_level)
-            break
+            if level.room_id == room_id:
+                self._apply_room_level(level)
+                break
+
+    async def resync(self) -> None:
+        """Re-read every room from the hub and push its state to the entities."""
+        levels = await self._read_levels("every room")
+        if levels is None:
+            return
+        for level in levels:
+            self._apply_room_level(level)
+
+    def set_channel_level(self, room_id: int, channel_id: int, value: int) -> None:
+        """Reflect a level the hub reported for a channel on its light or cover."""
+        unique_id = f"{self.hub_id}_{room_id}_{channel_id}"
+        if (cover := self._cover_map.get(unique_id)) is not None:
+            cover.current_cover_position = value
+        if (light := self._light_map.get(unique_id)) is not None:
+            # After a scene recall a hub without scene levels resets its
+            # channel levels to 0 while the lights stay on in the scene
+            if (
+                value == 0
+                and self._room_scene.get(room_id, -1) > 0
+                and not self.room_levels_reported(room_id)
+            ):
+                return
+            light.brightness = value
 
     def _try_start_event_listener_task(self) -> None:
         """Start the event listener task."""
@@ -208,23 +452,18 @@ async def subscribe_to_events(hub_client: HubClient) -> None:
     """Subscribe to events method."""
     async for event in hub_client.get_events():
         try:
-            if event and isinstance(event, LevelChangedEvent):
-                unique_id = f"{hub_client.hub_id}_{event.room_id}_{event.channel_id}"
-
-                # Handle cover entities (blinds use level for position)
-                if unique_id in hub_client._cover_map:
-                    hub_client._cover_map[unique_id].current_cover_position = effective_level(event)
-
-                # Handle light entities
-                if unique_id in hub_client._light_map:
-                    hub_client._light_map[unique_id].brightness = effective_level(event)
-
-            elif event and isinstance(event, SceneChangedEvent):
+            if isinstance(event, LevelChangedEvent):
+                hub_client.set_channel_level(
+                    event.room_id, event.channel_id, effective_level(event)
+                )
+            elif isinstance(event, SceneChangedEvent):
                 # The hub doesn't push level events for scene 0 (e.g. Off from
                 # a keypad), so apply the scene to the affected entities here
                 hub_client.apply_scene(
-                    event.room_id, event.channel_id, event.active_scene_id
+                    event.room_id, event.channel_id, event.scene_id, event.active_scene_id
                 )
+            elif isinstance(event, ResyncRequested):
+                await hub_client.resync()
 
         except Exception as e:
             _LOGGER.exception("Unexpected exception: %s", repr(e))

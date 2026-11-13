@@ -7,6 +7,7 @@ import pytest
 from homeassistant.components.light import ATTR_BRIGHTNESS, ColorMode
 from homeassistant.core import HomeAssistant
 
+from custom_components.rako.hub_client import ASSUMED_ON_LEVEL
 from custom_components.rako.light import RakoLightEntity, async_setup_entry
 from rakopy.errors import SendCommandError
 from rakopy.model import Channel, Room
@@ -49,6 +50,8 @@ async def test_setup_entry_discovers_lights(
     # 1 room-level light + 2 channel-level lights = 3
     light_entities = [e for e in added if isinstance(e, RakoLightEntity)]
     assert len(light_entities) == 3
+    # the hub's levels teach the client whether it reports scene levels
+    mock_hub_client.learn_levels.assert_called_once_with(mock_hub_client.get_levels.return_value)
 
 
 async def test_setup_entry_skips_blind_rooms(
@@ -282,3 +285,56 @@ def test_brightness_setter_before_added_to_hass(mock_hub_client) -> None:
 
     assert light.brightness == 0
     assert light.is_on is False
+
+
+# ---------------------------------------------------------------------------
+# Scene-aware state
+# ---------------------------------------------------------------------------
+
+def test_light_in_scene_starts_on(mock_hub_client) -> None:
+    """On a hub without scene levels, a light whose room is in a scene starts on despite level 0."""
+    room = Room(id=1, title="Hall", type="LIGHT", mode="NORMAL", channels=[], scenes=[])
+    mock_hub_client.room_levels_reported.return_value = False
+    light = RakoLightEntity(
+        hub_client=mock_hub_client, room=room, channel=None,
+        channel_level=make_channel_level(0, 0), room_scene_id=1,
+    )
+    assert light.is_on
+    assert light.brightness == ASSUMED_ON_LEVEL
+
+    off = RakoLightEntity(
+        hub_client=mock_hub_client, room=room, channel=None,
+        channel_level=make_channel_level(0, 0), room_scene_id=0,
+    )
+    assert not off.is_on
+
+
+def test_light_in_scene_trusts_a_hub_that_reports_scene_levels(mock_hub_client) -> None:
+    """On a hub with scene levels a channel the scene sets to 0 starts off."""
+    room = Room(id=1, title="Hall", type="LIGHT", mode="NORMAL", channels=[], scenes=[])
+    mock_hub_client.room_levels_reported.return_value = True
+    light = RakoLightEntity(
+        hub_client=mock_hub_client, room=room, channel=None,
+        channel_level=make_channel_level(0, 0), room_scene_id=1,
+    )
+    assert not light.is_on
+    mock_hub_client.room_levels_reported.assert_called_with(1)
+
+
+def test_assume_on_uses_last_brightness(mock_hub_client, monkeypatch) -> None:
+    """assume_on brings an off light back at the last level it was seen at."""
+    light = _make_light(mock_hub_client, brightness=0)
+    monkeypatch.setattr(light, "async_write_ha_state", lambda: None)
+
+    light.assume_on()
+    assert light.brightness == ASSUMED_ON_LEVEL
+
+    light.brightness = 120
+    light.brightness = 0
+    light.assume_on()
+    assert light.brightness == 120
+
+    # an on light keeps its level
+    light.brightness = 60
+    light.assume_on()
+    assert light.brightness == 60
