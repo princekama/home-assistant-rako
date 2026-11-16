@@ -36,7 +36,7 @@ This is a Home Assistant custom component (`custom_components/rako/`) for contro
 
 ### Key types
 
-- `HubClient` (extends `rakopy.hub.Hub`) — Central hub communication client. Maintains maps of registered entities (`_light_map`, `_cover_map`, `_scene_map`) keyed by `unique_id`.
+- `HubClient` (extends `rakopy.hub.Hub`) — Central hub communication client. Maintains maps of registered entities (`_light_map`, `_cover_map`, `_scene_map`) keyed by `unique_id`. It replaces rakopy's `_send`/`_query` with `_request`, which owns the command connection's request/reply cycle: each exchange holds the lock (connecting included), skips lines that can't be its reply, and drops the connection if it is abandoned (cancelled, timed out, or no usable reply), so a late reply is never read by the next request (#36).
 - `RakoDomainEntryData` (TypedDict) — Stored on `entry.runtime_data` with keys `hub_id` and `hub_client`.
 - Room types: `"LIGHT"` rooms produce light entities, `"BLIND"` rooms produce cover entities. All rooms produce scene select entities.
 

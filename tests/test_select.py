@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from homeassistant.core import HomeAssistant
 
-from custom_components.rako.hub_client import HubClient
+from custom_components.rako.hub_client import HubClient, HubReplyError
 from custom_components.rako.select import RakoSceneEntity, async_setup_entry
 from rakopy.model import Room, Scene
 
@@ -258,6 +258,25 @@ async def test_select_option_off_closes_covers_in_blind_room(hass: HomeAssistant
     client.set_scene.assert_awaited_once_with(1, 0, 0)
     assert cover.current_cover_position == 0
     assert other_cover.current_cover_position == 255
+
+
+async def test_select_scene_succeeds_when_the_follow_up_read_fails(
+    hass: HomeAssistant, monkeypatch
+) -> None:
+    """Once the scene command has reached the hub, a failed re-read of the room's levels
+    must not fail the service call: an automation would stop before turning the room off (#36)."""
+    with patch("custom_components.rako.hub_client.Hub.__init__", return_value=None):
+        client = HubClient(name="Test Hub", host="192.168.1.1", entry_id="e", hass=hass)
+    client.set_scene = AsyncMock()
+    client.get_levels = AsyncMock(side_effect=HubReplyError("no reply"))
+
+    entity = _make_scene_entity(client, current_scene_id=0)
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+
+    await entity.async_select_option("Scene 2")
+
+    client.set_scene.assert_awaited_once_with(1, 0, 2)
+    assert entity.current_option == "Scene 2"
 
 
 def test_current_option_setter_before_added_to_hass(mock_hub_client) -> None:

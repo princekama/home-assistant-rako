@@ -11,15 +11,18 @@ from homeassistant.components.cover import CoverEntity
 from homeassistant.components.light import LightEntity
 from homeassistant.components.select import SelectEntity
 from homeassistant.core import HomeAssistant
+from rakopy.errors import SendCommandError
 from rakopy.hub import Hub
 from rakopy.model import Level, LevelChangedEvent, SceneChangedEvent
 from .model import RakoDomainEntryData
 
 _LOGGER = logging.getLogger(__name__)
 
-# rakopy reads replies with no timeout while holding its connection lock, so a
-# query the hub never answers would block every later command
-REFRESH_TIMEOUT = 5
+# Commands share one connection and wait their turn for it, so one the hub
+# never answers would otherwise block every later command
+COMMAND_TIMEOUT = 5
+# Lines read past while looking for a request's reply before giving up on it
+MAX_SKIPPED_LINES = 5
 
 EVENT_CONNECT_TIMEOUT = 10
 # Re-read every room from the hub when the event stream has been quiet this long
@@ -41,6 +44,20 @@ ASSUMED_ON_LEVEL = 255
 @dataclass
 class ResyncRequested:
     """Yielded by get_events when the entities should be re-read from the hub."""
+
+
+class HubReplyError(ValueError):
+    """The hub sent no usable reply to a request on the command connection."""
+
+
+def _is_query_reply(reply: dict) -> bool:
+    """Whether a line from the hub can be the reply to a query: those carry a list."""
+    return isinstance(reply.get("payload"), list)
+
+
+def _is_send_reply(reply: dict) -> bool:
+    """Whether a line from the hub can be the reply to a command rather than to a query."""
+    return not isinstance(reply.get("payload"), list)
 
 
 def effective_level(level) -> int:
@@ -186,24 +203,104 @@ class HubClient(Hub):
             await self._try_cancel_event_listener_task()
 
     async def _query(self, query_type: str, func, room_id: int = None):
-        """Run a rakopy query, logging the request for debugging."""
+        """Run a query on the command connection and map each item of the reply with func.
+
+        Replaces rakopy's, which reads whatever line comes next as the reply.
+        """
         _LOGGER.debug("Querying hub: %s room %s", query_type, room_id)
-        result = await super()._query(query_type, func, room_id)
+        request = {
+            "name": "query",
+            "payload": {"queryType": query_type, "roomId": room_id or 0},
+        }
+        reply = await self._request(request, _is_query_reply)
+        if reply.get("name") == "error":
+            raise HubReplyError(
+                f"The hub refused the {query_type} query: {reply.get('payload')}"
+            )
+        try:
+            result = [func(data) for data in reply["payload"]]
+        except (KeyError, TypeError, AttributeError) as e:
+            raise HubReplyError(f"Unexpected {query_type} reply from the hub: {e!r}") from e
         _LOGGER.debug("Hub answered %s room %s", query_type, room_id)
         return result
 
     async def _send(self, request) -> None:
-        """Send a rakopy command, logging the request for debugging."""
+        """Send a command on the command connection and wait for the hub to acknowledge it.
+
+        Replaces rakopy's, which reads whatever line comes next as the reply.
+        """
         _LOGGER.debug("Sending to hub: %s", request)
-        await super()._send(request)
+        reply = await self._request(request, _is_send_reply)
+        if reply.get("name") == "error":
+            raise SendCommandError(
+                f"The hub refused {request}: {reply.get('payload')}"
+            )
         _LOGGER.debug("Hub acknowledged: %s", request)
 
-    def _close_connection(self) -> None:
-        """Drop the command connection so the next call reconnects.
+    async def _request(self, request: dict, accept) -> dict:
+        """Send one request on the command connection and return the hub's reply to it.
 
-        After an abandoned query the hub's late reply would otherwise be read
-        as the reply to the next command.
+        The hub answers each request with one line and nothing on the line
+        says which request it answers, so a reply left unread would be taken
+        as the reply to the next request, and every reply after it would be
+        one behind (#36). So:
+
+        - The whole exchange, connecting included, holds the connection lock.
+        - If the exchange is abandoned for any reason (cancelled with the
+          service call that made it, timed out, or the reply not understood),
+          the connection is dropped before the lock is released, so a late
+          reply can't be read by the next request.
+        - Lines that can't be the reply (accept is False, or a tracker event)
+          are skipped; an error reply is always returned.
         """
+        async with self._lock:
+            try:
+                async with asyncio.timeout(COMMAND_TIMEOUT):
+                    await self._connect()
+                    self._writer.write(str.encode(json.dumps(request) + "\r\n"))
+                    await self._writer.drain()
+                    for _ in range(MAX_SKIPPED_LINES + 1):
+                        line = await self._reader.readline()
+                        if not line:
+                            raise ConnectionResetError("the hub closed the connection")
+                        try:
+                            reply = json.loads(line)
+                        except ValueError:
+                            reply = None
+                        if (
+                            isinstance(reply, dict)
+                            and reply.get("name") != "tracker"
+                            and (reply.get("name") == "error" or accept(reply))
+                        ):
+                            return reply
+                        _LOGGER.debug(
+                            "Skipping a line from the hub that is not the reply to %s: %r",
+                            request.get("name"),
+                            line[:200],
+                        )
+                    raise HubReplyError(f"The hub sent no reply to {request.get('name')}")
+            except BaseException:
+                self._close_connection()
+                raise
+
+    async def _connect(self) -> None:
+        """Open the command connection if it isn't open. The caller holds the lock."""
+        if (
+            self._writer is not None
+            and self._writer.transport is not None
+            and not self._writer.transport.is_closing()
+        ):
+            return
+        self._reader, self._writer = await asyncio.open_connection(
+            self.host, self.port, limit=1048576
+        )
+        payload = {"version": 2, "client_name": self.client_name, "subscriptions": []}
+        self._writer.write(str.encode(f"SUB,JSON,{json.dumps(payload)}\r\n"))
+        await self._writer.drain()
+        await self._reader.readline()
+
+    def _close_connection(self) -> None:
+        """Drop the command connection so the next request reconnects."""
         if self._writer is not None:
             self._writer.close()
         self._reader = None
@@ -384,13 +481,17 @@ class HubClient(Hub):
                 cover.current_cover_position = value
 
     async def _read_levels(self, what: str):
-        """Read every room's levels from the hub, or None when the hub did not answer."""
+        """Read every room's levels from the hub, or None when the hub did not answer.
+
+        A failed read is logged, not raised: after a scene command it must not
+        fail a service call whose command already reached the hub.
+        """
         try:
-            return await asyncio.wait_for(self.get_levels(), REFRESH_TIMEOUT)
-        except asyncio.TimeoutError:
+            return await self.get_levels()
+        except TimeoutError:
             _LOGGER.warning("Timed out reading levels for %s, reconnecting", what)
-            self._close_connection()
         except (OSError, ValueError) as e:
+            # ValueError includes HubReplyError
             _LOGGER.warning("Could not read levels for %s: %s", what, repr(e))
         return None
 
