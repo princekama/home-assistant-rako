@@ -42,7 +42,7 @@ This is a Home Assistant custom component (`custom_components/rako/`) for contro
 
 ### External dependency
 
-All hub communication uses the [`rakopy`](https://pypi.org/project/rakopy/) library (pinned to v0.0.5 in `manifest.json` and `requirements_dev.txt`). Key classes: `Hub`, `Room`, `Channel`, `ChannelLevel`, `Level`, `HubStatus`, `LevelChangedEvent`, `SceneChangedEvent`, `SendCommandError`.
+All hub communication uses the [`rakopy`](https://pypi.org/project/rakopy/) library (pinned to v0.0.7 in `manifest.json` and `requirements_dev.txt`). Key classes: `Hub`, `Room`, `Channel`, `ChannelLevel`, `Level`, `HubStatus`, `LevelChangedEvent`, `SceneChangedEvent`, `SendCommandError`.
 
 ## Conventions
 
