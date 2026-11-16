@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from homeassistant.core import HomeAssistant
 
+from rakopy.errors import SendCommandError
 from rakopy.model import Level, LevelChangedEvent, SceneChangedEvent
 
 import socket
 
 from custom_components.rako.hub_client import (
     EVENT_RECONNECT_DELAY,
+    MAX_SKIPPED_LINES,
     HubClient,
+    HubReplyError,
     ResyncRequested,
     _enable_keepalive,
     _parse_event,
@@ -536,27 +540,19 @@ async def test_refresh_room_propagates_unexpected_errors(hass: HomeAssistant) ->
         await client.refresh_room(1)
 
 
-async def test_refresh_room_times_out_and_reconnects(hass: HomeAssistant) -> None:
-    """A query the hub never answers should time out and drop the connection."""
+@pytest.mark.parametrize(
+    "error", [TimeoutError(), HubReplyError("no reply"), ConnectionResetError("gone")]
+)
+async def test_refresh_room_logs_a_failed_read(hass: HomeAssistant, error) -> None:
+    """A read that times out or gets no usable reply is logged, and entities keep their state."""
     client = _make_refresh_client(hass, [])
-
-    async def never_answers():
-        await asyncio.sleep(3600)
-
-    client.get_levels = never_answers
-    writer = MagicMock()
-    client._reader = MagicMock()
-    client._writer = writer
+    client.get_levels = AsyncMock(side_effect=error)
     light = MagicMock()
     light.brightness = 42
     client._light_map = {f"{MOCK_HUB_ID}_1_0": light}
 
-    with patch("custom_components.rako.hub_client.REFRESH_TIMEOUT", 0.01):
-        await client.refresh_room(1)
+    await client.refresh_room(1)
 
-    writer.close.assert_called_once()
-    assert client._reader is None
-    assert client._writer is None
     assert light.brightness == 42
 
 
@@ -575,29 +571,297 @@ async def test_close_connection_without_connection(hass: HomeAssistant) -> None:
 # _query / _send logging wrappers
 # ---------------------------------------------------------------------------
 
-async def test_query_delegates_to_rakopy(hass: HomeAssistant) -> None:
-    """_query should pass through to rakopy and return its result."""
-    client = _make_hub_client(hass)
-    func = MagicMock()
+# ---------------------------------------------------------------------------
+# Command connection: one reply per request, never one behind (#36)
+# ---------------------------------------------------------------------------
 
+LEVEL_REPLY = (
+    b'{"name":"query_LEVEL","payload":[{"roomId":1,"currentScene":2,'
+    b'"channel":[{"channelId":0,"currentLevel":255}]}]}\r\n'
+)
+SEND_ACK = b'{"name":"send","payload":{"result":1}}\r\n'
+ERROR_REPLY = b'{"name":"error","payload":{"message":"UNKNOWN_ERROR"}}\r\n'
+TRACKER_LINE = (
+    b'{"name":"tracker","type":"scene","payload":'
+    b'{"roomId":1,"channelId":0,"scene":2,"activeScene":2}}\r\n'
+)
+
+
+class _FakeCommandHub:
+    """In-memory hub behind the command connection.
+
+    Each connection gets a real StreamReader. The hub answers what the client
+    writes: SUB with connected, a query with LEVEL_REPLY (held back by
+    query_delay, like a slow hub), anything else with SEND_ACK. A list of
+    lines in `script` replaces the answer to the next request.
+    """
+
+    def __init__(self) -> None:
+        self.connections = 0
+        self.writers: list[MagicMock] = []
+        self.requests: list[dict] = []
+        self.query_delay = 0.0
+        self.script: list[list[bytes]] = []
+
+    async def open_connection(self, *args, **kwargs):
+        self.connections += 1
+        reader = asyncio.StreamReader()
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        writer.transport.is_closing.return_value = False
+        closed = False
+
+        def feed(lines):
+            if not closed:
+                for line in lines:
+                    reader.feed_data(line)
+
+        def write(data):
+            if data.startswith(b"SUB"):
+                feed([b'{"name":"connected","payload":{}}\r\n'])
+                return
+            request = json.loads(data)
+            self.requests.append(request)
+            if self.script:
+                feed(self.script.pop(0))
+            elif request["name"] == "query":
+                asyncio.get_running_loop().call_later(self.query_delay, feed, [LEVEL_REPLY])
+            else:
+                feed([SEND_ACK])
+
+        def close():
+            nonlocal closed
+            closed = True
+            writer.transport.is_closing.return_value = True
+            reader.feed_eof()
+
+        writer.write.side_effect = write
+        writer.close.side_effect = close
+        self.writers.append(writer)
+        return reader, writer
+
+
+@pytest.fixture
+def fake_hub():
+    """Route the command connection to a _FakeCommandHub."""
+    hub = _FakeCommandHub()
     with patch(
-        "custom_components.rako.hub_client.Hub._query", new_callable=AsyncMock, return_value=["x"]
-    ) as mock_query:
-        result = await client._query("LEVEL", func, 3)
-
-    mock_query.assert_awaited_once_with("LEVEL", func, 3)
-    assert result == ["x"]
+        "custom_components.rako.hub_client.asyncio.open_connection", hub.open_connection
+    ):
+        yield hub
 
 
-async def test_send_delegates_to_rakopy(hass: HomeAssistant) -> None:
-    """_send should pass through to rakopy."""
-    client = _make_hub_client(hass)
-    request = {"name": "send"}
+def _make_command_client(hass: HomeAssistant) -> HubClient:
+    """A HubClient with rakopy's real __init__, for driving the command connection."""
+    return HubClient(name=MOCK_NAME, host=MOCK_HOST, entry_id="test_entry_id", hass=hass)
 
-    with patch("custom_components.rako.hub_client.Hub._send", new_callable=AsyncMock) as mock_send:
-        await client._send(request)
 
-    mock_send.assert_awaited_once_with(request)
+def _assert_level_reply(levels) -> None:
+    assert [(level.room_id, level.current_scene_id) for level in levels] == [(1, 2)]
+
+
+async def test_get_levels_and_set_scene_round_trip(hass: HomeAssistant, fake_hub) -> None:
+    """Requests share one connection and each gets its own reply."""
+    client = _make_command_client(hass)
+
+    _assert_level_reply(await client.get_levels())
+    await client.set_scene(1, 0, 2)
+
+    assert fake_hub.connections == 1
+    assert fake_hub.requests == [
+        {"name": "query", "payload": {"queryType": "LEVEL", "roomId": 0}},
+        {
+            "name": "send",
+            "payload": {"room": 1, "channel": 0, "action": {"command": "scene", "scene": 2}},
+        },
+    ]
+
+
+async def test_cancelled_query_does_not_leave_its_reply_for_the_next_request(
+    hass: HomeAssistant, fake_hub
+) -> None:
+    """A query cancelled before its reply arrives (e.g. with the automation that made it)
+    drops the connection, so its late reply can't be read as the reply to a later request.
+
+    This is what #36 hit: get_levels read a send ack and raised
+    "TypeError: string indices must be integers, not 'str'".
+    """
+    client = _make_command_client(hass)
+    fake_hub.query_delay = 0.05
+    query = asyncio.create_task(client.get_levels())
+    await asyncio.sleep(0.01)
+    query.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await query
+    fake_hub.writers[0].close.assert_called_once()
+    await asyncio.sleep(0.1)
+
+    await client.set_scene(1, 0, 2)
+    _assert_level_reply(await client.get_levels())
+
+    assert fake_hub.connections == 2
+
+
+@pytest.mark.parametrize(
+    "lines", [[SEND_ACK, LEVEL_REPLY], [TRACKER_LINE, LEVEL_REPLY], [b"not json\r\n", LEVEL_REPLY]]
+)
+async def test_query_skips_lines_that_are_not_its_reply(
+    hass: HomeAssistant, fake_hub, lines
+) -> None:
+    """A query reads past a stale command ack, a tracker event or garbage to its own reply."""
+    client = _make_command_client(hass)
+    fake_hub.script = [lines]
+
+    _assert_level_reply(await client.get_levels())
+
+    fake_hub.writers[0].close.assert_not_called()
+
+
+@pytest.mark.parametrize("lines", [[LEVEL_REPLY, SEND_ACK], [TRACKER_LINE, SEND_ACK]])
+async def test_send_skips_lines_that_are_not_its_reply(
+    hass: HomeAssistant, fake_hub, lines
+) -> None:
+    """A command reads past a stale query reply or a tracker event to its own ack,
+    leaving the next query its own reply."""
+    client = _make_command_client(hass)
+    fake_hub.script = [lines]
+
+    await client.set_scene(1, 0, 2)
+    _assert_level_reply(await client.get_levels())
+
+    assert fake_hub.connections == 1
+
+
+async def test_request_gives_up_after_too_many_unrelated_lines(
+    hass: HomeAssistant, fake_hub
+) -> None:
+    """With no reply among the lines it reads, a request fails and drops the connection."""
+    client = _make_command_client(hass)
+    fake_hub.script = [[SEND_ACK] * (MAX_SKIPPED_LINES + 1)]
+
+    with pytest.raises(HubReplyError):
+        await client.get_levels()
+
+    fake_hub.writers[0].close.assert_called_once()
+    _assert_level_reply(await client.get_levels())
+    assert fake_hub.connections == 2
+
+
+async def test_query_with_malformed_items_raises_hub_reply_error(
+    hass: HomeAssistant, fake_hub
+) -> None:
+    """Items the reply can't be mapped from raise HubReplyError, which callers handle as a
+    failed read, never a TypeError."""
+    client = _make_command_client(hass)
+    fake_hub.script = [[b'{"name":"query_LEVEL","payload":["result"]}\r\n']]
+
+    with pytest.raises(HubReplyError):
+        await client.get_levels()
+
+
+async def test_send_error_reply_raises_send_command_error(
+    hass: HomeAssistant, fake_hub
+) -> None:
+    """The hub refusing a command raises SendCommandError and keeps the connection."""
+    client = _make_command_client(hass)
+    fake_hub.script = [[ERROR_REPLY]]
+
+    with pytest.raises(SendCommandError):
+        await client.set_scene(1, 0, 2)
+
+    fake_hub.writers[0].close.assert_not_called()
+
+
+async def test_query_error_reply_raises_hub_reply_error(hass: HomeAssistant, fake_hub) -> None:
+    """The hub refusing a query raises HubReplyError."""
+    client = _make_command_client(hass)
+    fake_hub.script = [[ERROR_REPLY]]
+
+    with pytest.raises(HubReplyError):
+        await client.get_levels()
+
+
+async def test_request_the_hub_never_answers_times_out_and_reconnects(
+    hass: HomeAssistant, fake_hub
+) -> None:
+    """A request the hub never answers times out and drops the connection; the next reconnects."""
+    client = _make_command_client(hass)
+    fake_hub.script = [[]]
+
+    with patch("custom_components.rako.hub_client.COMMAND_TIMEOUT", 0.05):
+        with pytest.raises(TimeoutError):
+            await client.set_scene(1, 0, 2)
+
+    fake_hub.writers[0].close.assert_called_once()
+    _assert_level_reply(await client.get_levels())
+    assert fake_hub.connections == 2
+
+
+async def test_hub_closing_the_connection_fails_the_request(
+    hass: HomeAssistant, fake_hub
+) -> None:
+    """The hub closing the connection mid-request raises a connection error and reconnects next time."""
+    client = _make_command_client(hass)
+    await client.set_scene(1, 0, 1)
+    fake_hub.writers[0].write.side_effect = lambda data: fake_hub.writers[0].close()
+
+    with pytest.raises(ConnectionResetError):
+        await client.set_scene(1, 0, 2)
+
+    _assert_level_reply(await client.get_levels())
+    assert fake_hub.connections == 2
+
+
+async def test_cancelled_while_waiting_its_turn_leaves_the_connection_alone(
+    hass: HomeAssistant, fake_hub
+) -> None:
+    """A request cancelled before it gets the connection doesn't disturb the one using it."""
+    client = _make_command_client(hass)
+    fake_hub.query_delay = 0.05
+    query = asyncio.create_task(client.get_levels())
+    await asyncio.sleep(0.01)
+    waiting = asyncio.create_task(client.set_scene(1, 0, 2))
+    await asyncio.sleep(0.01)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+
+    _assert_level_reply(await query)
+    fake_hub.writers[0].close.assert_not_called()
+    assert len(fake_hub.requests) == 1
+
+
+async def test_concurrent_requests_open_one_connection(hass: HomeAssistant, fake_hub) -> None:
+    """Requests made together wait their turn on a single connection."""
+    client = _make_command_client(hass)
+    fake_hub.query_delay = 0.01
+
+    _, levels, _ = await asyncio.gather(
+        client.set_scene(1, 0, 2), client.get_levels(), client.set_level(1, 1, 128)
+    )
+
+    _assert_level_reply(levels)
+    assert fake_hub.connections == 1
+    assert len(fake_hub.requests) == 3
+
+
+async def test_refresh_room_survives_a_reply_it_cannot_use(hass: HomeAssistant, fake_hub) -> None:
+    """refresh_room logs a read that gets no usable reply, keeps entity state and leaves
+    the connection ready for the next request."""
+    client = _make_command_client(hass)
+    mock_entry = MagicMock()
+    mock_entry.runtime_data = {"hub_id": MOCK_HUB_ID}
+    hass.config_entries.async_get_entry = MagicMock(return_value=mock_entry)
+    light = MagicMock()
+    light.brightness = 42
+    client._light_map = {f"{MOCK_HUB_ID}_1_0": light}
+    fake_hub.script = [[SEND_ACK] * (MAX_SKIPPED_LINES + 1)]
+
+    await client.refresh_room(1)
+
+    assert light.brightness == 42
+    await client.refresh_room(1)
+    assert light.brightness == 255
 
 
 # ---------------------------------------------------------------------------
